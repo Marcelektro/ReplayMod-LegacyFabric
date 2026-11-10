@@ -30,6 +30,18 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      # Gradle itself runs on 21; the build also needs 8 (ReplayStudio and the older
+      # targets) and 17 as toolchains, which are not on the runner by default.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 8
+          set-default: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 17
+          set-default: false
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
@@ -42,7 +54,9 @@ jobs:
         working-directory: work
         env:
           REPLAYMOD_VERSION: ${{ steps.version.outputs.version }}
-        run: ./gradlew :1.8.9-fabric:build -x test --no-daemon
+        run: |
+          ./gradlew :1.8.9-fabric:build -x test --no-daemon \
+            -Dorg.gradle.java.installations.paths="$JAVA_HOME_8_X64,$JAVA_HOME_17_X64,$JAVA_HOME_21_X64"
 
       - name: Collect the jar
         env:

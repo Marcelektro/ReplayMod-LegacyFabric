@@ -1,0 +1,94 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Work out the version
+        id: version
+        run: |
+          # Tag v2.6.28-1 -> 2.6.28-1. Other builds: dev-<short sha>
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="dev-${GITHUB_SHA::7}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Apply patches onto upstream
+        run: scripts/apply.sh
+
+      - name: Build
+        working-directory: work
+        env:
+          REPLAYMOD_VERSION: ${{ steps.version.outputs.version }}
+        run: ./gradlew :1.8.9-fabric:build -x test --no-daemon
+
+      - name: Collect the jar
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir dist
+          jars=(work/versions/1.8.9-fabric/build/libs/*-ornithe.jar)
+          [[ ${#jars[@]} -eq 1 ]] || { echo "expected exactly one -ornithe.jar, got: ${jars[*]}" >&2; exit 1; }
+          out="dist/ReplayMod-${VERSION}-1.8.9-ornithe.jar"
+          cp "${jars[0]}" "$out"
+          (cd dist && sha256sum "$(basename "$out")" > "$(basename "$out").sha256")
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ReplayMod-${{ steps.version.outputs.version }}-1.8.9-ornithe
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cat > notes.md <<'NOTES'
+          ReplayMod for **Minecraft 1.8.9 on Ornithe** (e.g. Polyfrost OneClient).
+
+          **Install:** download the `.jar` below and put it into the `mods` folder of your Ornithe 1.8.9 instance. No Legacy Fabric or other loader API is needed.
+
+          Verify with the `.sha256` file if you like. See the README for known gaps.
+          NOTES
+          gh release create "$TAG" dist/* \
+            --title "$TAG" \
+            --notes-file notes.md \
+            --generate-notes \
+            --verify-tag

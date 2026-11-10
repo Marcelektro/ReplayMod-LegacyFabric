@@ -8,7 +8,7 @@ comes out is made for Ornithe and does not need Legacy Fabric or any other loade
 
 ## Project state
 
-**Status: working prototype, not released yet.** 
+**Status: working prototype.** 
 
 The build produces a jar (`*-ornithe.jar`) which records, saves and
 plays back replays in a OneClient 1.8.9 instance (Ornithe, Fabric Loader 0.20.1, Java 25, with OneClient's own mods).
@@ -21,9 +21,18 @@ on top of a pinned upstream revision (see `upstream.conf`). Upstream is not redi
 
 ## Using it
 
-There are no releases yet, build the jar as described under [Workflow](#workflow) and put
-`versions/1.8.9-fabric/build/libs/*-ornithe.jar` into the `mods` folder of an Ornithe 1.8.9 instance 
-(e.g. OneClient's mods folder).
+Download the latest `ReplayMod-*-1.8.9-ornithe.jar` from the [Releases](../../releases) page and put it into
+the `mods` folder of an Ornithe 1.8.9 instance (e.g. OneClient's mods folder).
+
+To build it yourself, see [Workflow](#workflow); the jar ends up in
+`versions/1.8.9-fabric/build/libs/*-ornithe.jar`.
+
+## Releases
+
+Pushing a tag like `v2.6.28-1` (upstream ReplayMod version, then our own revision) makes GitHub Actions
+(`.github/workflows/build.yml`) apply the patches, build the jar with that version and publish a GitHub Release
+with the jar and an SHA-256 file. 
+Pushes to `main` and pull requests are only built, and the jar is attached to the workflow run.
 
 ## Layout
 
@@ -84,7 +93,7 @@ To move to a newer upstream: change `UPSTREAM_COMMIT`, run `scripts/apply.sh`, r
   loading a replay, replay overlay, camera movement and speed (scroll wheel), seeking forwards and backwards,
   exiting the replay
 - [x] Test video rendering (needs FFmpeg), keyframes/paths and the camera roll
-- [ ] Release builds (clean version string, CI)
+- [x] Release builds (clean version string, CI)
 
 ## Known gaps
 
@@ -95,7 +104,8 @@ To move to a newer upstream: change `UPSTREAM_COMMIT`, run `scripts/apply.sh`, r
   exercised by the tests above.
 - Only OneConfig is used to list the mod in OneClient; ReplayMod's own settings still live in its own screen, which
   the OneConfig entry opens, rather than being mirrored into OneConfig.
-- The version string still ends in `-dirty` (the jGui submodule is moved off upstream's pinned commit).
+- Local builds still get a version ending in `-dirty` (the jGui submodule is moved off upstream's pinned commit); set
+  `REPLAYMOD_VERSION=...` to override it, as the release workflow does.
 - Netty may log `LEAK: ByteBuf.release() was not called` around seeking. In a minimal setup without OneClient's mods
   a ViaVersion error from ReplayStudio's bundled copy was also logged while loading a replay; neither had an
   effect in testing.

@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ReplayMod-LegacyFabric <noreply@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 19:31:36 +0100
+Subject: [PATCH] Add 1.8.9-fabric build target
+
+Registers a Fabric variant of 1.8.9 next to the Forge one: a new
+preprocessor node, a project name based loader switch, and Legacy
+Fabric's yarn mappings and intermediary (Loom has nothing for 1.8.9
+besides those).
+
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 0de7543e84..2fcbd5f377 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -11,6 +11,11 @@ loom {
+     noRunConfigs()
+ }
+ 
++// Legacy Fabric (Fabric on Minecraft versions older than 1.14) uses its own intermediary mappings
++if (platform.isFabric && platform.mcVersion < 11400) {
++    loom.intermediaryUrl.set("https://repo.legacyfabric.net/legacyfabric/net/legacyfabric/intermediary/${platform.mcVersionStr}/intermediary-${platform.mcVersionStr}-v2.jar")
++}
++
+ if (!platform.isUnobfuscated) {
+     loom.mixin.useLegacyMixinAp = true
+     loom.mixin.defaultRefmapName.set("mixins.jgui.refmap.json")
+@@ -26,6 +31,11 @@ repositories {
+         }
+     }
+     maven("https://repo.spongepowered.org/maven/") // for 0.7.11-SNAPSHOT Mixin
++    maven("https://repo.legacyfabric.net/legacyfabric/") {
++        content {
++            includeGroupByRegex("net\\.legacyfabric.*")
++        }
++    }
+ }
+ 
+ dependencies {
+diff --git a/root.gradle.kts b/root.gradle.kts
+index 44b44c1cc2..9fa520c16a 100644
+--- a/root.gradle.kts
++++ b/root.gradle.kts
+@@ -50,6 +50,7 @@ preprocess {
+     val mc11200 = createNode("1.12", 11200, "srg")
+     val mc10904 = createNode("1.9.4", 10904, "srg")
+     val mc10809 = createNode("1.8.9", 10809, "srg")
++    val mc10809Fabric = createNode("1.8.9-fabric", 10809, "yarn")
+     val mc10800 = createNode("1.8", 10800, "srg")
+     val mc10710 = createNode("1.7.10", 10710, "srg")
+ 
+@@ -82,6 +83,7 @@ preprocess {
+     mc11404Forge.link(mc11200, file("versions/1.14.4-forge/mapping.txt"))
+     mc11200.link(mc10904)
+     mc10904.link(mc10809)
++    mc10809.link(mc10809Fabric)
+     mc10809.link(mc10800)
+     mc10800.link(mc10710, file("versions/1.8/mapping.txt"))
+ }
+@@ -89,6 +91,6 @@ preprocess {
+ subprojects {
+     val (major, minor, patch) = name.split("-")[0].split(".") + listOf("0")
+     val mcVersion = major.toInt() * 10000 + minor.toInt() * 100 + patch.toInt()
+-    val fabric = mcVersion >= 1_14_00 && !name.endsWith("-forge")
++    val fabric = (mcVersion >= 1_14_00 && !name.endsWith("-forge")) || name.endsWith("-fabric")
+     extra.set("loom.platform", if (fabric) "fabric" else "forge")
+ }
+diff --git a/versions/1.8.9-fabric/gradle.properties b/versions/1.8.9-fabric/gradle.properties
+new file mode 100644
+index 0000000000..2e4c906f66
+--- /dev/null
++++ b/versions/1.8.9-fabric/gradle.properties
+@@ -0,0 +1 @@
++essential.defaults.loom.mappings=net.legacyfabric:yarn:1.8.9+build.604:v2

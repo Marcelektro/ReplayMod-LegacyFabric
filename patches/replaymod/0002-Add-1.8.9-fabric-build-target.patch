@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ReplayMod-LegacyFabric <noreply@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 19:31:36 +0100
+Subject: [PATCH] Add 1.8.9-fabric build target
+
+Registers a Fabric variant of 1.8.9 next to the Forge one: a new
+preprocessor node, a project name based loader switch, and Legacy
+Fabric's yarn mappings and intermediary (Loom has nothing for 1.8.9
+besides those).
+
+diff --git a/build.gradle.kts b/build.gradle.kts
+index f74a5b826f..b22cf8c0f6 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -12,6 +12,8 @@ plugins {
+ }
+ 
+ val mcVersion = platform.mcVersion
++// Fabric on a Minecraft version that predates the Fabric API / official Fabric intermediary
++val legacyFabric = platform.isFabric && mcVersion < 11400
+ 
+ var jGuiVersion = project.name
+ if (jGuiVersion in listOf("1.10.2", "1.11", "1.11.2")) jGuiVersion = "1.9.4"
+@@ -26,6 +28,10 @@ loom {
+     noServerRunConfigs()
+ }
+ 
++if (legacyFabric) {
++    loom.intermediaryUrl.set("https://repo.legacyfabric.net/legacyfabric/net/legacyfabric/intermediary/${platform.mcVersionStr}/intermediary-${platform.mcVersionStr}-v2.jar")
++}
++
+ if (!platform.isUnobfuscated) {
+     loom.mixin.useLegacyMixinAp = true
+     loom.mixin.defaultRefmapName.set("mixins.replaymod.refmap.json")
+@@ -39,6 +45,11 @@ if (platform.isLegacyForge) {
+ 
+ repositories {
+     mavenLocal()
++    maven("https://repo.legacyfabric.net/legacyfabric/") {
++        content {
++            includeGroupByRegex("net\\.legacyfabric.*")
++        }
++    }
+     maven("https://repo.spongepowered.org/maven/")
+     maven("https://maven.terraformersmc.com/releases/") {
+         content {
+@@ -71,7 +82,9 @@ val shadow by configurations.creating {
+ }
+ 
+ dependencies {
+-    if (platform.isFabric) {
++    if (legacyFabric) {
++        modImplementation("net.legacyfabric.legacy-fabric-api:legacy-fabric-api:1.13.5+1.8.9")
++    } else if (platform.isFabric) {
+         val fabricApiVersion = when (mcVersion) {
+             11404 -> "0.4.3+build.247-1.14"
+             11502 -> "0.5.1+build.294-1.15"
+@@ -184,7 +197,7 @@ dependencies {
+     implementation(project(path = jGui.path, configuration = if (platform.isUnobfuscated) null else "namedElements"))
+     implementation(shadow("com.github.ReplayMod:lwjgl-utils:27dcd66")!!)
+ 
+-    if (platform.isFabric) {
++    if (platform.isFabric && !legacyFabric) {
+         val modMenuVersion = when {
+             mcVersion >= 26_03_00 -> "21.0.0"
+             mcVersion >= 26_02_00 -> "20.0.0-beta.4"
+diff --git a/root.gradle.kts b/root.gradle.kts
+index 0f479446b7..8ec5924974 100755
+--- a/root.gradle.kts
++++ b/root.gradle.kts
+@@ -52,7 +52,7 @@ subprojects {
+     }
+     val (major, minor, patch) = name.split("-")[0].split(".") + listOf("0")
+     val mcVersion = major.toInt() * 10000 + minor.toInt() * 100 + patch.toInt()
+-    val fabric = mcVersion >= 1_14_00 && !name.endsWith("-forge")
++    val fabric = (mcVersion >= 1_14_00 && !name.endsWith("-forge")) || name.endsWith("-fabric")
+     extra.set("loom.platform", if (fabric) "fabric" else "forge")
+ 
+     afterEvaluate {
+@@ -250,6 +250,7 @@ preprocess {
+     val mc11002 = createNode("1.10.2", 11002, "srg")
+     val mc10904 = createNode("1.9.4", 10904, "srg")
+     val mc10809 = createNode("1.8.9", 10809, "srg")
++    val mc10809Fabric = createNode("1.8.9-fabric", 10809, "yarn")
+     val mc10800 = createNode("1.8", 10800, "srg")
+     val mc10710 = createNode("1.7.10", 10710, "srg")
+ 
+@@ -288,6 +289,7 @@ preprocess {
+     mc11100.link(mc11002)
+     mc11002.link(mc10904)
+     mc10904.link(mc10809, file("versions/mapping-forge-1.9.4-1.8.9.txt"))
++    mc10809.link(mc10809Fabric)
+     mc10809.link(mc10800, file("versions/mapping-forge-1.8.9-1.8.txt"))
+     mc10800.link(mc10710, file("versions/mapping-forge-1.8-1.7.10.txt"))
+ }
+diff --git a/settings.gradle.kts b/settings.gradle.kts
+index ed17646b2f..67116f2ea8 100644
+--- a/settings.gradle.kts
++++ b/settings.gradle.kts
+@@ -20,6 +20,7 @@ val jGuiVersions = listOf(
+         // "1.7.10",
+         // "1.8",
+         "1.8.9",
++        "1.8.9-fabric",
+         "1.9.4",
+         "1.12",
+         "1.14.4-forge",
+@@ -54,6 +55,7 @@ val replayModVersions = listOf(
+         // "1.7.10",
+         // "1.8",
+         "1.8.9",
++        "1.8.9-fabric",
+         "1.9.4",
+         "1.10.2",
+         "1.11",
+diff --git a/versions/1.8.9-fabric/.gitkeep b/versions/1.8.9-fabric/.gitkeep
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/versions/1.8.9-fabric/gradle.properties b/versions/1.8.9-fabric/gradle.properties
+new file mode 100644
+index 0000000000..2e4c906f66
+--- /dev/null
++++ b/versions/1.8.9-fabric/gradle.properties
+@@ -0,0 +1 @@
++essential.defaults.loom.mappings=net.legacyfabric:yarn:1.8.9+build.604:v2

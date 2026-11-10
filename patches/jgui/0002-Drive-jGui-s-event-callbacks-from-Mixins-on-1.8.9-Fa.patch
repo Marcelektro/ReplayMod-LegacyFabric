@@ -1,0 +1,476 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ReplayMod-LegacyFabric <noreply@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 20:15:15 +0100
+Subject: [PATCH] Drive jGui's event callbacks from Mixins on 1.8.9 Fabric
+
+jGui gets its screen, input, tick and HUD events from Forge on <=1.12 and
+from 1.14+ specific Mixins on Fabric. Fabric on 1.8.9 has neither, and no
+loader API providing them, so:
+
+- gate the Forge event bus and the 1.14+ Mixins to what they were written for
+- add ScreenInputCallback, the equivalent of Forge's Mouse/KeyboardInputEvent.Pre
+- add 1.8.9-fabric Mixins which fire the existing callbacks
+- ignore input in wrappers of vanilla screens that are no longer current
+- don't declare IOException on overrides, Legacy Yarn dropped it
+
+diff --git a/src/main/java/de/johni0702/minecraft/gui/container/AbstractGuiOverlay.java b/src/main/java/de/johni0702/minecraft/gui/container/AbstractGuiOverlay.java
+index dc5ad1919c..c769431df6 100644
+--- a/src/main/java/de/johni0702/minecraft/gui/container/AbstractGuiOverlay.java
++++ b/src/main/java/de/johni0702/minecraft/gui/container/AbstractGuiOverlay.java
+@@ -315,7 +315,7 @@ public abstract class AbstractGuiOverlay<T extends AbstractGuiOverlay<T>> extend
+         //#else
+         //$$ @Override
+         //$$ protected void keyTyped(char typedChar, int keyCode)
+-                //#if MC>=10800
++                //#if MC>=10800 && FABRIC<=0
+                 //$$ throws IOException
+                 //#endif
+         //$$ {
+@@ -338,7 +338,7 @@ public abstract class AbstractGuiOverlay<T extends AbstractGuiOverlay<T>> extend
+             return
+         //#else
+         //$$ protected void mouseClicked(int mouseX, int mouseY, int mouseButton)
+-                //#if MC>=10800
++                //#if MC>=10800 && FABRIC<=0
+                 //$$ throws IOException
+                 //#endif
+         //$$ {
+@@ -411,7 +411,7 @@ public abstract class AbstractGuiOverlay<T extends AbstractGuiOverlay<T>> extend
+         //#else
+         //$$ @Override
+         //$$ public void handleMouseInput()
+-                //#if MC>=10800
++                //#if MC>=10800 && FABRIC<=0
+                 //$$ throws IOException
+                 //#endif
+         //$$ {
+diff --git a/src/main/java/de/johni0702/minecraft/gui/container/AbstractGuiScreen.java b/src/main/java/de/johni0702/minecraft/gui/container/AbstractGuiScreen.java
+index adc5f9e627..7d1ca7cf18 100644
+--- a/src/main/java/de/johni0702/minecraft/gui/container/AbstractGuiScreen.java
++++ b/src/main/java/de/johni0702/minecraft/gui/container/AbstractGuiScreen.java
+@@ -336,7 +336,7 @@ public abstract class AbstractGuiScreen<T extends AbstractGuiScreen<T>> extends
+         //#else
+         //$$ @Override
+         //$$ protected void keyTyped(char typedChar, int keyCode)
+-                //#if MC>=10800
++                //#if MC>=10800 && FABRIC<=0
+                 //$$ throws IOException
+                 //#endif
+         //$$ {
+@@ -362,7 +362,7 @@ public abstract class AbstractGuiScreen<T extends AbstractGuiScreen<T>> extends
+             return
+         //#else
+         //$$ protected void mouseClicked(int mouseX, int mouseY, int mouseButton)
+-                //#if MC>=10800
++                //#if MC>=10800 && FABRIC<=0
+                 //$$ throws IOException
+                 //#endif
+         //$$ {
+@@ -435,7 +435,7 @@ public abstract class AbstractGuiScreen<T extends AbstractGuiScreen<T>> extends
+         //#else
+         //$$ @Override
+         //$$ public void handleMouseInput()
+-                //#if MC>=10800
++                //#if MC>=10800 && FABRIC<=0
+                 //$$ throws IOException
+                 //#endif
+         //$$ {
+diff --git a/src/main/java/de/johni0702/minecraft/gui/container/VanillaGuiScreen.java b/src/main/java/de/johni0702/minecraft/gui/container/VanillaGuiScreen.java
+index 4b9826e758..867564450d 100644
+--- a/src/main/java/de/johni0702/minecraft/gui/container/VanillaGuiScreen.java
++++ b/src/main/java/de/johni0702/minecraft/gui/container/VanillaGuiScreen.java
+@@ -24,9 +24,11 @@ import de.johni0702.minecraft.gui.versions.callbacks.PreTickCallback;
+ import net.minecraft.client.util.math.MatrixStack;
+ //#endif
+ 
+-//#if FABRIC>=1
++//#if FABRIC>=1 && MC>=11400
+ import de.johni0702.minecraft.gui.versions.callbacks.KeyboardCallback;
+ import de.johni0702.minecraft.gui.versions.callbacks.MouseCallback;
++//#elseif FABRIC>=1
++//$$ import de.johni0702.minecraft.gui.versions.callbacks.ScreenInputCallback;
+ //#elseif MC<=11202
+ //$$ import net.minecraftforge.client.event.GuiOpenEvent;
+ //$$ import net.minecraftforge.client.event.GuiScreenEvent;
+@@ -40,8 +42,10 @@ import de.johni0702.minecraft.gui.versions.callbacks.MouseCallback;
+ //$$ import cpw.mods.fml.common.eventhandler.SubscribeEvent;
+ //#endif
+ 
+-//#if MC<11400
++//#if MC<11400 && FABRIC<=0
+ //$$ import net.minecraftforge.common.MinecraftForge;
++//#endif
++//#if MC<11400
+ //$$ import java.io.IOException;
+ //#endif
+ 
+@@ -198,8 +202,10 @@ public class VanillaGuiScreen extends GuiScreen implements Draggable, KeyHandler
+     //$$ public
+     //#endif
+     class EventHandler extends EventRegistrations
+-        //#if FABRIC>=1
++        //#if FABRIC>=1 && MC>=11400
+         implements KeyboardCallback, MouseCallback
++        //#elseif FABRIC>=1
++        //$$ implements ScreenInputCallback
+         //#endif
+     {
+         private boolean active;
+@@ -251,7 +257,7 @@ public class VanillaGuiScreen extends GuiScreen implements Draggable, KeyHandler
+             //#endif
+         }
+ 
+-        //#if FABRIC>=1
++        //#if FABRIC>=1 && MC>=11400
+         { on(MouseCallback.EVENT, this); }
+ 
+         @Override
+@@ -318,6 +324,38 @@ public class VanillaGuiScreen extends GuiScreen implements Draggable, KeyHandler
+             return getSuperMcGui().charTyped(charInput.character, charInput.modifiers);
+             //#endif
+         }
++        //#elseif FABRIC>=1
++        //$$ private boolean mouseHandled;
++        //$$ private boolean keyHandled;
++        //$$ private boolean charHandled;
++        //$$
++        //$$ { on(ScreenInputCallback.EVENT, this); }
++        //$$
++        //$$ @Override
++        //$$ public boolean mouseInput() throws IOException {
++        //$$     // A wrapper which is still registered after its screen is gone must not take input away from the current one
++        //$$     if (getMinecraft().currentScreen != mcScreen) {
++        //$$         return false;
++        //$$     }
++        //$$     mouseHandled = true;
++        //$$     getSuperMcGui().handleMouse();
++        //$$     return mouseHandled;
++        //$$ }
++        //$$
++        //$$ @Override
++        //$$ public boolean keyboardInput() throws IOException {
++        //$$     if (getMinecraft().currentScreen != mcScreen) {
++        //$$         return false;
++        //$$     }
++        //$$     // Skip key-up events, we currently have no mechanism to properly handle them
++        //$$     if (!org.lwjgl.input.Keyboard.getEventKeyState()) {
++        //$$         return false;
++        //$$     }
++        //$$     keyHandled = org.lwjgl.input.Keyboard.getEventKey() != 0;
++        //$$     charHandled = org.lwjgl.input.Keyboard.getEventCharacter() != '\0';
++        //$$     getSuperMcGui().handleKeyboard();
++        //$$     return keyHandled || charHandled;
++        //$$ }
+         //#elseif MC<=11202
+         //$$ private boolean mouseHandled;
+         //$$ private boolean keyHandled;
+diff --git a/src/main/java/de/johni0702/minecraft/gui/utils/EventRegistrations.java b/src/main/java/de/johni0702/minecraft/gui/utils/EventRegistrations.java
+index 67c8c0e3c9..56eba97a56 100644
+--- a/src/main/java/de/johni0702/minecraft/gui/utils/EventRegistrations.java
++++ b/src/main/java/de/johni0702/minecraft/gui/utils/EventRegistrations.java
+@@ -1,6 +1,6 @@
+ package de.johni0702.minecraft.gui.utils;
+ 
+-//#if MC<=11302
++//#if MC<=11302 && FABRIC<=0
+ //$$ import de.johni0702.minecraft.gui.versions.forge.EventsAdapter;
+ //$$ import net.minecraftforge.common.MinecraftForge;
+ //#endif
+@@ -13,7 +13,7 @@ import java.util.ArrayList;
+ import java.util.List;
+ 
+ public class EventRegistrations {
+-    //#if MC<=11302
++    //#if MC<=11302 && FABRIC<=0
+     //$$ static { new EventsAdapter().register(); }
+     //#endif
+ 
+@@ -29,7 +29,7 @@ public class EventRegistrations {
+     }
+ 
+     public void register() {
+-        //#if MC<=11302
++        //#if MC<=11302 && FABRIC<=0
+         //$$ MinecraftForge.EVENT_BUS.register(this);
+         //#endif
+         //#if MC<10809
+@@ -41,7 +41,7 @@ public class EventRegistrations {
+     }
+ 
+     public void unregister() {
+-        //#if MC<=11302
++        //#if MC<=11302 && FABRIC<=0
+         //$$ MinecraftForge.EVENT_BUS.unregister(this);
+         //#endif
+         //#if MC<10809
+diff --git a/src/main/java/de/johni0702/minecraft/gui/versions/callbacks/ScreenInputCallback.java b/src/main/java/de/johni0702/minecraft/gui/versions/callbacks/ScreenInputCallback.java
+new file mode 100644
+index 0000000000..85276955d7
+--- /dev/null
++++ b/src/main/java/de/johni0702/minecraft/gui/versions/callbacks/ScreenInputCallback.java
+@@ -0,0 +1,40 @@
++package de.johni0702.minecraft.gui.versions.callbacks;
++
++import de.johni0702.minecraft.gui.utils.Event;
++
++import java.io.IOException;
++
++/**
++ * Pre-input hooks for the current screen on Minecraft versions where the screens process their own raw
++ * LWJGL input ({@code handleMouse}/{@code handleKeyboard}) and no loader provides an event for it.
++ * Both methods return true if the event was handled, in which case the screen's own handling is skipped.
++ */
++public interface ScreenInputCallback {
++    Event<ScreenInputCallback> EVENT = Event.create((listeners) ->
++            new ScreenInputCallback() {
++                @Override
++                public boolean mouseInput() throws IOException {
++                    for (ScreenInputCallback listener : listeners) {
++                        if (listener.mouseInput()) {
++                            return true;
++                        }
++                    }
++                    return false;
++                }
++
++                @Override
++                public boolean keyboardInput() throws IOException {
++                    for (ScreenInputCallback listener : listeners) {
++                        if (listener.keyboardInput()) {
++                            return true;
++                        }
++                    }
++                    return false;
++                }
++            }
++    );
++
++    boolean mouseInput() throws IOException;
++
++    boolean keyboardInput() throws IOException;
++}
+diff --git a/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinGameRenderer.java b/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinGameRenderer.java
+index 727f923f09..892b7f15b9 100644
+--- a/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinGameRenderer.java
++++ b/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinGameRenderer.java
+@@ -1,4 +1,4 @@
+-//#if FABRIC>=1
++//#if FABRIC>=1 && MC>=11400
+ package de.johni0702.minecraft.gui.versions.mixin;
+ 
+ import de.johni0702.minecraft.gui.versions.callbacks.PostRenderScreenCallback;
+diff --git a/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinKeyboardListener.java b/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinKeyboardListener.java
+index 209bf4125e..6956fc4182 100644
+--- a/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinKeyboardListener.java
++++ b/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinKeyboardListener.java
+@@ -1,4 +1,4 @@
+-//#if FABRIC>=1
++//#if FABRIC>=1 && MC>=11400
+ package de.johni0702.minecraft.gui.versions.mixin;
+ 
+ import de.johni0702.minecraft.gui.function.CharInput;
+diff --git a/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinMinecraft.java b/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinMinecraft.java
+index 9156d957a2..e3da0bd910 100644
+--- a/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinMinecraft.java
++++ b/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinMinecraft.java
+@@ -1,5 +1,5 @@
+ // Note: this will also work in 1.13 but we don't really support 1.13 and MixinGradle is yet to be updated
+-//#if FABRIC>=1
++//#if FABRIC>=1 && MC>=11400
+ package de.johni0702.minecraft.gui.versions.mixin;
+ 
+ import de.johni0702.minecraft.gui.versions.callbacks.OpenGuiScreenCallback;
+diff --git a/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinMouseListener.java b/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinMouseListener.java
+index cb5c97b890..73158b0cb5 100644
+--- a/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinMouseListener.java
++++ b/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinMouseListener.java
+@@ -1,4 +1,4 @@
+-//#if FABRIC>=1
++//#if FABRIC>=1 && MC>=11400
+ package de.johni0702.minecraft.gui.versions.mixin;
+ 
+ import de.johni0702.minecraft.gui.function.Click;
+diff --git a/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinScreen.java b/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinScreen.java
+index bfdd48e1b9..12f0d92e27 100644
+--- a/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinScreen.java
++++ b/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinScreen.java
+@@ -1,4 +1,4 @@
+-//#if FABRIC>=1
++//#if FABRIC>=1 && MC>=11400
+ package de.johni0702.minecraft.gui.versions.mixin;
+ 
+ import de.johni0702.minecraft.gui.versions.callbacks.InitScreenCallback;
+diff --git a/src/main/java/de/johni0702/minecraft/gui/versions/mixin/Mixin_RenderHudCallback.java b/src/main/java/de/johni0702/minecraft/gui/versions/mixin/Mixin_RenderHudCallback.java
+index a26783af9c..c0a232c9e1 100644
+--- a/src/main/java/de/johni0702/minecraft/gui/versions/mixin/Mixin_RenderHudCallback.java
++++ b/src/main/java/de/johni0702/minecraft/gui/versions/mixin/Mixin_RenderHudCallback.java
+@@ -1,4 +1,4 @@
+-//#if FABRIC>=1
++//#if FABRIC>=1 && MC>=11400
+ package de.johni0702.minecraft.gui.versions.mixin;
+ 
+ import de.johni0702.minecraft.gui.versions.callbacks.RenderHudCallback;
+diff --git a/src/main/resources/mixins.jgui.json b/src/main/resources/mixins.jgui.json
+index fbc58ec8de..7bef327016 100644
+--- a/src/main/resources/mixins.jgui.json
++++ b/src/main/resources/mixins.jgui.json
+@@ -9,6 +9,12 @@
+     //$$ "Mixin_PassEvents_HandleKeys",
+     //#endif
+     "Mixin_PassEventsExt",
++    //#if FABRIC>=1 && MC<11400
++    //$$ "MixinLegacyScreen",
++    //$$ "MixinLegacyMinecraft",
++    //$$ "MixinLegacyGameRenderer",
++    //$$ "MixinLegacyInGameHud",
++    //#endif
+     //#if MC>=11400
+     //#if MC>=11400
+     "Mixin_RenderHudCallback",
+diff --git a/versions/1.8.9-fabric/src/main/java/de/johni0702/minecraft/gui/versions/forge/EventsAdapter.java b/versions/1.8.9-fabric/src/main/java/de/johni0702/minecraft/gui/versions/forge/EventsAdapter.java
+new file mode 100644
+index 0000000000..c690defcd7
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/de/johni0702/minecraft/gui/versions/forge/EventsAdapter.java
+@@ -0,0 +1 @@
++// Forge only
+diff --git a/versions/1.8.9-fabric/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinLegacyGameRenderer.java b/versions/1.8.9-fabric/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinLegacyGameRenderer.java
+new file mode 100644
+index 0000000000..cf151d2577
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinLegacyGameRenderer.java
+@@ -0,0 +1,18 @@
++package de.johni0702.minecraft.gui.versions.mixin;
++
++import de.johni0702.minecraft.gui.versions.MatrixStack;
++import de.johni0702.minecraft.gui.versions.callbacks.PostRenderScreenCallback;
++import net.minecraft.client.render.GameRenderer;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++@Mixin(GameRenderer.class)
++public abstract class MixinLegacyGameRenderer {
++    @Inject(method = "render(FJ)V",
++            at = @At(value = "INVOKE", target = "Lnet/minecraft/client/gui/screen/Screen;render(IIF)V", shift = At.Shift.AFTER))
++    private void jgui_postRenderScreen(float partialTicks, long nanoTime, CallbackInfo ci) {
++        PostRenderScreenCallback.EVENT.invoker().postRenderScreen(new MatrixStack(), partialTicks);
++    }
++}
+diff --git a/versions/1.8.9-fabric/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinLegacyInGameHud.java b/versions/1.8.9-fabric/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinLegacyInGameHud.java
+new file mode 100644
+index 0000000000..cdaecf6269
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinLegacyInGameHud.java
+@@ -0,0 +1,17 @@
++package de.johni0702.minecraft.gui.versions.mixin;
++
++import de.johni0702.minecraft.gui.versions.MatrixStack;
++import de.johni0702.minecraft.gui.versions.callbacks.RenderHudCallback;
++import net.minecraft.client.gui.hud.InGameHud;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++@Mixin(InGameHud.class)
++public abstract class MixinLegacyInGameHud {
++    @Inject(method = "render(F)V", at = @At("RETURN"))
++    private void jgui_renderHud(float partialTicks, CallbackInfo ci) {
++        RenderHudCallback.EVENT.invoker().renderHud(new MatrixStack(), partialTicks);
++    }
++}
+diff --git a/versions/1.8.9-fabric/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinLegacyMinecraft.java b/versions/1.8.9-fabric/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinLegacyMinecraft.java
+new file mode 100644
+index 0000000000..81cd32b689
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinLegacyMinecraft.java
+@@ -0,0 +1,23 @@
++package de.johni0702.minecraft.gui.versions.mixin;
++
++import de.johni0702.minecraft.gui.versions.callbacks.OpenGuiScreenCallback;
++import de.johni0702.minecraft.gui.versions.callbacks.PreTickCallback;
++import net.minecraft.client.MinecraftClient;
++import net.minecraft.client.gui.screen.Screen;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++@Mixin(MinecraftClient.class)
++public abstract class MixinLegacyMinecraft {
++    @Inject(method = "tick", at = @At("HEAD"))
++    private void jgui_preTick(CallbackInfo ci) {
++        PreTickCallback.EVENT.invoker().preTick();
++    }
++
++    @Inject(method = "setScreen", at = @At("HEAD"))
++    private void jgui_openScreen(Screen newScreen, CallbackInfo ci) {
++        OpenGuiScreenCallback.EVENT.invoker().openGuiScreen(newScreen);
++    }
++}
+diff --git a/versions/1.8.9-fabric/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinLegacyScreen.java b/versions/1.8.9-fabric/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinLegacyScreen.java
+new file mode 100644
+index 0000000000..19c83b0c71
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/de/johni0702/minecraft/gui/versions/mixin/MixinLegacyScreen.java
+@@ -0,0 +1,58 @@
++package de.johni0702.minecraft.gui.versions.mixin;
++
++import de.johni0702.minecraft.gui.versions.callbacks.InitScreenCallback;
++import de.johni0702.minecraft.gui.versions.callbacks.ScreenInputCallback;
++import net.minecraft.client.gui.screen.Screen;
++import net.minecraft.client.gui.widget.ButtonWidget;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.Shadow;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.Redirect;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++import java.io.IOException;
++import java.util.List;
++
++/**
++ * Screen related events which Forge provides on legacy versions but Legacy Fabric does not.
++ */
++@Mixin(Screen.class)
++public abstract class MixinLegacyScreen {
++    @Shadow
++    protected List<ButtonWidget> buttons;
++
++    @Shadow
++    public abstract void handleMouse() throws IOException;
++
++    @Shadow
++    public abstract void handleKeyboard() throws IOException;
++
++    @Inject(method = "init(Lnet/minecraft/client/MinecraftClient;II)V",
++            at = @At(value = "INVOKE", target = "Lnet/minecraft/client/gui/screen/Screen;init()V"))
++    private void jgui_preInit(CallbackInfo ci) {
++        InitScreenCallback.Pre.EVENT.invoker().preInitScreen((Screen) (Object) this);
++    }
++
++    @Inject(method = "init(Lnet/minecraft/client/MinecraftClient;II)V",
++            at = @At(value = "INVOKE", target = "Lnet/minecraft/client/gui/screen/Screen;init()V", shift = At.Shift.AFTER))
++    private void jgui_postInit(CallbackInfo ci) {
++        InitScreenCallback.EVENT.invoker().initScreen((Screen) (Object) this, this.buttons);
++    }
++
++    @Redirect(method = "handleInput",
++            at = @At(value = "INVOKE", target = "Lnet/minecraft/client/gui/screen/Screen;handleMouse()V"))
++    private void jgui_handleMouse(Screen self) throws IOException {
++        if (!ScreenInputCallback.EVENT.invoker().mouseInput()) {
++            handleMouse();
++        }
++    }
++
++    @Redirect(method = "handleInput",
++            at = @At(value = "INVOKE", target = "Lnet/minecraft/client/gui/screen/Screen;handleKeyboard()V"))
++    private void jgui_handleKeyboard(Screen self) throws IOException {
++        if (!ScreenInputCallback.EVENT.invoker().keyboardInput()) {
++            handleKeyboard();
++        }
++    }
++}

@@ -1,0 +1,19 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ReplayMod-LegacyFabric <noreply@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 19:24:27 +0100
+Subject: [PATCH] Fix unmapped GuiButton.x when remapping 1.14.4-forge to
+ 1.12.2
+
+The MCP snapshot used for 1.14.4-forge has no name for Widget.x, so it
+leaked into the preprocessed sources as func_214457_x and broke the
+1.8.9 - 1.12.2 builds.
+
+diff --git a/versions/mapping-forge-1.14.4-1.12.2.txt b/versions/mapping-forge-1.14.4-1.12.2.txt
+index f439858e90..b450d622cb 100644
+--- a/versions/mapping-forge-1.14.4-1.12.2.txt
++++ b/versions/mapping-forge-1.14.4-1.12.2.txt
+@@ -52,3 +52,4 @@ net.minecraft.util.Hand net.minecraft.util.EnumHand
+ net.minecraft.network.play.server.SUpdateRecipesPacket net.minecraft.network.play.server.SPacketRecipeBook
+ net.minecraft.network.play.server.SOpenHorseWindowPacket net.minecraft.network.play.server.SPacketOpenWindow
+ net.minecraft.network.play.server.SWindowPropertyPacket net.minecraft.network.play.server.SPacketWindowItems
++net.minecraft.client.gui.widget.Widget func_214457_x net.minecraft.client.gui.GuiButton x

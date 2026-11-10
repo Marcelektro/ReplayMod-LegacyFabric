@@ -1,0 +1,2362 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ReplayMod-LegacyFabric <noreply@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 20:57:15 +0100
+Subject: [PATCH] Port ReplayMod to Fabric on 1.8.9 (Ornithe)
+
+Make the 1.8.9-fabric target build and run on Ornithe, as used by
+Polyfrost's OneClient. ReplayMod's <=1.12 code paths assume Forge, so each
+use of Forge API gets an alternative which needs no loader API:
+
+- Fabric entrypoint, settings, mod info and metadata instead of @Mod/FML
+- render tick, RenderWorldLast, RenderHand, hotbar and crosshair events are
+  fired from Mixins (they are Forge events on <=1.12)
+- key bindings are registered once the game options exist, and the plugin
+  channel and custom payload recording are handled by Mixins
+- buttons injected into screens call their handler themselves; the OneClient
+  main menu gets the button too
+- scrolling in the replay adjusts the camera speed through a Mixin
+- an access widener replaces the access transformers Forge applies
+- Forge only compat code (FML handshake, coremod, mapwriter, ...) is stubbed
+- a OneConfig entry with buttons for the viewer and the settings
+- tools/OrnitheRetarget.java, run by the ornitheJar task, translates the
+  jar from Legacy Fabric's names to Ornithe's
+
+Shared code is changed with preprocessor conditions so the other targets
+are unaffected.
+
+diff --git a/build.gradle.kts b/build.gradle.kts
+index b22cf8c0f6..d4032ae471 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -1,4 +1,6 @@
+ import com.replaymod.gradle.preprocess.PreprocessTask
++import org.gradle.kotlin.dsl.support.serviceOf
++import org.gradle.process.ExecOperations
+ import gg.essential.gradle.util.*
+ import net.fabricmc.loom.task.RemapJarTask
+ 
+@@ -30,6 +32,8 @@ loom {
+ 
+ if (legacyFabric) {
+     loom.intermediaryUrl.set("https://repo.legacyfabric.net/legacyfabric/net/legacyfabric/intermediary/${platform.mcVersionStr}/intermediary-${platform.mcVersionStr}-v2.jar")
++    // Forge's access transformers are not available, so the members they would have opened up need a widener
++    loom.accessWidenerPath.set(file("src/main/resources/replaymod.accesswidener"))
+ }
+ 
+ if (!platform.isUnobfuscated) {
+@@ -83,7 +87,7 @@ val shadow by configurations.creating {
+ 
+ dependencies {
+     if (legacyFabric) {
+-        modImplementation("net.legacyfabric.legacy-fabric-api:legacy-fabric-api:1.13.5+1.8.9")
++        // No Fabric API equivalent: loaders for these versions differ too much (Legacy Fabric, Ornithe)
+     } else if (platform.isFabric) {
+         val fabricApiVersion = when (mcVersion) {
+             11404 -> "0.4.3+build.247-1.14"
+@@ -392,3 +396,88 @@ val bundleJar by tasks.registering(com.github.jengelman.gradle.plugins.shadow.ta
+     }
+ }
+ tasks.assemble { dependsOn(bundleJar) }
++
++if (legacyFabric) {
++    // We build against Legacy Fabric's mappings (the only ones Loom can currently be pointed at for 1.8.9), but the
++    // loader used by OneClient for 1.8.9 is Ornithe, which names Minecraft's classes differently. So the jar is
++    // translated to Ornithe's names after the fact, see tools/OrnitheRetarget.java.
++    repositories {
++        maven("https://maven.ornithemc.net/releases") {
++            content {
++                includeGroup("net.ornithemc")
++            }
++        }
++    }
++    // OneConfig, which is part of OneClient, is only used to list ReplayMod there (see ReplayModOneConfig)
++    repositories {
++        maven("https://repo.polyfrost.org/releases") {
++            content {
++                includeGroup("org.polyfrost.oneconfig")
++            }
++        }
++    }
++    // (resolved through a configuration of its own: the jars are built for a newer JVM than we compile for, which
++    // would get them filtered out of the compile classpath)
++    val oneConfigApi by configurations.creating {
++        isTransitive = false
++    }
++    dependencies {
++        oneConfigApi("org.polyfrost.oneconfig:config-impl:1.6.2")
++        oneConfigApi("org.polyfrost.oneconfig:config:1.6.2")
++    }
++    // Compiled on its own as it needs Java 21 (see OneConfigSupport). Not a source set, those get picked up by the
++    // preprocessor.
++    val compileOneConfig by tasks.registering(JavaCompile::class) {
++        source(fileTree("src/oneconfig/java"))
++        classpath = sourceSets.main.get().output + sourceSets.main.get().compileClasspath + oneConfigApi
++        destinationDirectory.set(layout.buildDirectory.dir("classes/oneconfig"))
++        options.release.set(21)
++    }
++    tasks.jar {
++        from(compileOneConfig.flatMap { it.destinationDirectory })
++    }
++    val ornitheTool by configurations.creating
++    val legacyFabricIntermediary by configurations.creating
++    val calamusIntermediary by configurations.creating
++    dependencies {
++        ornitheTool("net.fabricmc:tiny-remapper:0.10.3")
++        legacyFabricIntermediary("net.legacyfabric:intermediary:${platform.mcVersionStr}:v2")
++        calamusIntermediary("net.ornithemc:calamus-intermediary-gen2:${platform.mcVersionStr}")
++    }
++
++    val ornitheJar by tasks.registering {
++        group = "build"
++        description = "Converts the bundled jar to Ornithe's Minecraft names"
++
++        val input = bundleJar.flatMap { it.archiveFile }
++        val output = layout.buildDirectory.file("libs/${base.archivesName.get()}-$version-ornithe.jar")
++        val tool = rootProject.file("tools/OrnitheRetarget.java")
++        val mcVersion = platform.mcVersionStr
++        val gradleHome = gradle.gradleUserHomeDir
++        val execOps = project.serviceOf<ExecOperations>()
++        inputs.file(input)
++        inputs.file(tool)
++        inputs.files(ornitheTool, legacyFabricIntermediary, calamusIntermediary)
++        outputs.file(output)
++        doLast {
++            // The obfuscated Minecraft jar, as downloaded by Loom
++            val minecraftJar = listOf("essential-loom", "fabric-loom")
++                .map { gradleHome.resolve("caches/$it/$mcVersion/minecraft-client.jar") }
++                .firstOrNull { it.exists() }
++                ?: throw GradleException("Could not find the Minecraft $mcVersion client jar in Loom's cache")
++            execOps.exec {
++                commandLine(
++                    File(System.getProperty("java.home"), "bin/java").path,
++                    "-cp", ornitheTool.files.joinToString(File.pathSeparator),
++                    tool.path,
++                    input.get().asFile.path,
++                    output.get().asFile.path,
++                    legacyFabricIntermediary.singleFile.path,
++                    calamusIntermediary.singleFile.path,
++                    minecraftJar.path,
++                )
++            }
++        }
++    }
++    tasks.assemble { dependsOn(ornitheJar) }
++}
+diff --git a/root.gradle.kts b/root.gradle.kts
+index 8ec5924974..89bc6e36f4 100755
+--- a/root.gradle.kts
++++ b/root.gradle.kts
+@@ -289,7 +289,7 @@ preprocess {
+     mc11100.link(mc11002)
+     mc11002.link(mc10904)
+     mc10904.link(mc10809, file("versions/mapping-forge-1.9.4-1.8.9.txt"))
+-    mc10809.link(mc10809Fabric)
++    mc10809.link(mc10809Fabric, file("versions/mapping-legacy-fabric-1.8.9.txt"))
+     mc10809.link(mc10800, file("versions/mapping-forge-1.8.9-1.8.txt"))
+     mc10800.link(mc10710, file("versions/mapping-forge-1.8-1.7.10.txt"))
+ }
+diff --git a/src/main/java/com/replaymod/compat/ReplayModCompat.java b/src/main/java/com/replaymod/compat/ReplayModCompat.java
+index 0d154b8933..240d98e2cd 100644
+--- a/src/main/java/com/replaymod/compat/ReplayModCompat.java
++++ b/src/main/java/com/replaymod/compat/ReplayModCompat.java
+@@ -5,11 +5,11 @@ import com.replaymod.core.Module;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ 
+-//#if MC<11400
++//#if MC<11400 && FABRIC<=0
+ //$$ import com.replaymod.compat.oranges17animations.HideInvisibleEntities;
+ //#endif
+ 
+-//#if MC<11400
++//#if MC<11400 && FABRIC<=0
+ //$$ import com.replaymod.compat.bettersprinting.DisableBetterSprinting;
+ //#endif
+ 
+@@ -26,10 +26,10 @@ public class ReplayModCompat implements Module {
+         new ShaderBeginRender().register();
+         //#endif
+         new DisableFastRender().register();
+-        //#if MC<11400
++        //#if MC<11400 && FABRIC<=0
+         //$$ new HideInvisibleEntities().register();
+         //#endif
+-        //#if MC<11400
++        //#if MC<11400 && FABRIC<=0
+         //$$ DisableBetterSprinting.register();
+         //#endif
+     }
+diff --git a/src/main/java/com/replaymod/core/KeyBindingRegistry.java b/src/main/java/com/replaymod/core/KeyBindingRegistry.java
+index 98e3e5f759..fd983fae2d 100644
+--- a/src/main/java/com/replaymod/core/KeyBindingRegistry.java
++++ b/src/main/java/com/replaymod/core/KeyBindingRegistry.java
+@@ -14,7 +14,7 @@ import net.minecraft.util.crash.CrashReport;
+ import net.minecraft.util.crash.CrashReportSection;
+ import net.minecraft.util.crash.CrashException;
+ 
+-//#if FABRIC>=1
++//#if FABRIC>=1 && MC>=11400
+ import com.replaymod.core.versions.LangResourcePack;
+ //#if MC>=11600
+ import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+@@ -25,6 +25,8 @@ import net.minecraft.client.util.InputUtil;
+ import net.minecraft.util.Identifier;
+ import static com.replaymod.core.ReplayMod.MOD_ID;
+ import static de.johni0702.minecraft.gui.versions.MCVer.identifier;
++//#elseif FABRIC>=1
++//$$ import com.replaymod.core.versions.LegacyKeyBindings;
+ //#else
+ //$$ import net.minecraftforge.fml.client.registry.ClientRegistry;
+ //#endif
+@@ -49,7 +51,7 @@ public class KeyBindingRegistry extends EventRegistrations {
+     //$$ private static final KeyBinding.Category CATEGORY = KeyBinding.Category.create(identifier(MOD_ID, "general"));
+     //#else
+     private static final String CATEGORY = "replaymod.title";
+-    //#if FABRIC>=1 && MC<11600
++    //#if FABRIC>=1 && MC>=11400 && MC<11600
+     //$$ static { net.fabricmc.fabric.api.client.keybinding.KeyBindingRegistry.INSTANCE.addCategory(CATEGORY); }
+     //#endif
+     //#endif
+@@ -73,7 +75,7 @@ public class KeyBindingRegistry extends EventRegistrations {
+     private Binding registerKeyBinding(String name, int keyCode, boolean onlyInRepay) {
+         Binding binding = bindings.get(name);
+         if (binding == null) {
+-            //#if FABRIC>=1
++            //#if FABRIC>=1 && MC>=11400
+             if (keyCode == 0) {
+                 keyCode = InputUtil.UNKNOWN_KEY.getCode();
+             }
+@@ -89,8 +91,12 @@ public class KeyBindingRegistry extends EventRegistrations {
+             //#endif
+             //#else
+             //$$ KeyBinding keyBinding = new KeyBinding(name, keyCode, CATEGORY);
++            //#if FABRIC>=1
++            //$$ LegacyKeyBindings.register(keyBinding);
++            //#else
+             //$$ ClientRegistry.registerKeyBinding(keyBinding);
+             //#endif
++            //#endif
+             binding = new Binding(name, keyBinding);
+             bindings.put(name, binding);
+             if (onlyInRepay) {
+diff --git a/src/main/java/com/replaymod/core/ReplayModMixinConfigPlugin.java b/src/main/java/com/replaymod/core/ReplayModMixinConfigPlugin.java
+index 443a21e087..51f32d0205 100644
+--- a/src/main/java/com/replaymod/core/ReplayModMixinConfigPlugin.java
++++ b/src/main/java/com/replaymod/core/ReplayModMixinConfigPlugin.java
+@@ -13,13 +13,13 @@ import java.util.Set;
+ import net.fabricmc.loader.api.FabricLoader;
+ //#endif
+ 
+-//#if MC>=11400
++//#if MC>=11400 || FABRIC>=1
+ import java.io.InputStream;
+ //#else
+ //$$ import net.minecraft.launchwrapper.Launch;
+ //#endif
+ 
+-//#if MC>=11200
++//#if MC>=11200 || FABRIC>=1
+ import org.objectweb.asm.tree.ClassNode;
+ //#else
+ //$$ import org.spongepowered.asm.lib.tree.ClassNode;
+@@ -27,7 +27,7 @@ import org.objectweb.asm.tree.ClassNode;
+ 
+ public class ReplayModMixinConfigPlugin implements IMixinConfigPlugin {
+     static boolean hasClass(String name) throws IOException {
+-        //#if MC>=11400
++        //#if MC>=11400 || FABRIC>=1
+         InputStream stream = Thread.currentThread().getContextClassLoader().getResourceAsStream(name.replace('.', '/') + ".class");
+         if (stream != null) stream.close();
+         return stream != null;
+diff --git a/src/main/java/com/replaymod/core/mixin/MixinMinecraft.java b/src/main/java/com/replaymod/core/mixin/MixinMinecraft.java
+index 9a3a043beb..63ae56390a 100644
+--- a/src/main/java/com/replaymod/core/mixin/MixinMinecraft.java
++++ b/src/main/java/com/replaymod/core/mixin/MixinMinecraft.java
+@@ -97,7 +97,7 @@ public abstract class MixinMinecraft
+     //$$     try {
+     //$$         runTickMouse();
+     //$$         // Update last tick time (MC ignores inputs when there hasn't been a tick in 200ms)
+-    //$$         systemTime = Minecraft.getSystemTime();
++    //$$         this.systemTime = Minecraft.getSystemTime();
+     //$$     } catch (IOException e) {
+     //$$         e.printStackTrace();
+     //$$     }
+@@ -116,10 +116,11 @@ public abstract class MixinMinecraft
+     //$$         ci.cancel();
+     //$$
+     //$$         // Update last tick time (MC ignores inputs when there hasn't been a tick in 200ms)
+-    //$$         systemTime = Minecraft.getSystemTime();
++    //$$         this.systemTime = Minecraft.getSystemTime();
+     //$$     }
+     //$$ }
+     //#endif
++    //#if FABRIC<=0
+     //$$ @Redirect(
+             //#if MC>=10904
+             //$$ method = "runTickMouse",
+@@ -134,6 +135,7 @@ public abstract class MixinMinecraft
+     //$$     return wheel;
+     //$$ }
+     //#endif
++    //#endif
+ 
+     //#if MC >= 26.1
+     //$$ MixinMinecraft() { super(null, false); }
+diff --git a/src/main/java/com/replaymod/core/versions/MCVer.java b/src/main/java/com/replaymod/core/versions/MCVer.java
+index b0bf50ca37..9ada696b56 100644
+--- a/src/main/java/com/replaymod/core/versions/MCVer.java
++++ b/src/main/java/com/replaymod/core/versions/MCVer.java
+@@ -74,7 +74,9 @@ import org.lwjgl.glfw.GLFW;
+ //#endif
+ //#else
+ //$$ import net.minecraft.client.resources.ResourcePackRepository;
++//#if FABRIC<=0
+ //$$ import net.minecraftforge.fml.client.FMLClientHandler;
++//#endif
+ //$$ import org.apache.logging.log4j.LogManager;
+ //$$ import org.lwjgl.Sys;
+ //$$ import java.awt.Desktop;
+@@ -536,7 +538,7 @@ public class MCVer {
+     //$$ public static class SoundEvent {}
+     //#endif
+ 
+-    //#if MC>=11400
++    //#if MC>=11400 || FABRIC>=1
+     private static Boolean hasOptifine;
+     public static boolean hasOptifine() {
+         if (hasOptifine == null) {
+diff --git a/src/main/java/com/replaymod/recording/ReplayModRecording.java b/src/main/java/com/replaymod/recording/ReplayModRecording.java
+index bddb9bb14e..f0caaa278c 100644
+--- a/src/main/java/com/replaymod/recording/ReplayModRecording.java
++++ b/src/main/java/com/replaymod/recording/ReplayModRecording.java
+@@ -22,7 +22,7 @@ import org.apache.logging.log4j.Logger;
+ //#if FABRIC>=1
+ //#if MC>=11700
+ //$$ import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+-//#else
++//#elseif MC>=11400
+ import net.fabricmc.fabric.api.network.ClientSidePacketRegistry;
+ //#endif
+ //#else
+@@ -82,8 +82,11 @@ public class ReplayModRecording implements Module {
+         //$$ ClientPlayNetworking.registerGlobalReceiver(Restrictions.ID, (payload, context) -> {});
+         //#elseif MC>=11700
+         //$$ ClientPlayNetworking.registerGlobalReceiver(Restrictions.PLUGIN_CHANNEL, (client, handler, buf, resp) -> {});
+-        //#else
++        //#elseif MC>=11400
+         ClientSidePacketRegistry.INSTANCE.register(Restrictions.PLUGIN_CHANNEL, (packetContext, packetByteBuf) -> {});
++        //#else
++        // Legacy Fabric loaders have no API for announcing plugin channels to the server, so servers will not
++        // learn that we understand the restrictions channel.
+         //#endif
+         //#else
+         //#if MC>=11400
+diff --git a/src/main/java/com/replaymod/render/blend/exporters/ItemExporter.java b/src/main/java/com/replaymod/render/blend/exporters/ItemExporter.java
+index 368e55b84b..e8c17b9f1c 100644
+--- a/src/main/java/com/replaymod/render/blend/exporters/ItemExporter.java
++++ b/src/main/java/com/replaymod/render/blend/exporters/ItemExporter.java
+@@ -12,6 +12,7 @@ import org.lwjgl.opengl.GL11;
+ 
+ //#if MC>=11400
+ import net.minecraft.util.math.Vec3i;
++//#elseif FABRIC>=1
+ //#else
+ //$$ import net.minecraftforge.client.model.pipeline.LightUtil;
+ //#endif
+@@ -132,6 +133,11 @@ public class ItemExporter implements Exporter {
+             //$$ buffer.setQuadColor(color);
+             //$$ Vec3i vec3i_1 = quad.getFace().getVector();
+             //$$ buffer.postNormal(vec3i_1.getX(), vec3i_1.getY(), vec3i_1.getZ());
++            //#elseif FABRIC>=1
++            //$$ buffer.putArray(quad.getVertexData());
++            //$$ buffer.putQuadColor(color);
++            //$$ net.minecraft.util.math.Vec3i vec3i_1 = quad.getFace().getVector();
++            //$$ buffer.putNormal(vec3i_1.getX(), vec3i_1.getY(), vec3i_1.getZ());
+             //#else
+             //$$ LightUtil.renderQuadColor(buffer, quad, color);
+             //#endif
+diff --git a/src/main/java/com/replaymod/render/hooks/EntityRendererHandler.java b/src/main/java/com/replaymod/render/hooks/EntityRendererHandler.java
+index fbc501ea0e..a139d6d5f4 100644
+--- a/src/main/java/com/replaymod/render/hooks/EntityRendererHandler.java
++++ b/src/main/java/com/replaymod/render/hooks/EntityRendererHandler.java
+@@ -19,17 +19,19 @@ import net.minecraft.client.gui.screen.Screen;
+ //$$ import org.joml.Vector3f;
+ //#endif
+ 
+-//#if MC>=11400
++//#if MC>=11400 || FABRIC>=1
+ import com.replaymod.core.events.PostRenderCallback;
+ import com.replaymod.core.events.PreRenderCallback;
+ import net.minecraft.util.Util;
+ //#else
++//#if FABRIC<=0
+ //#if MC>=11400
+ //$$ import net.minecraftforge.fml.hooks.BasicEventHooks;
+ //#else
+ //$$ import net.minecraftforge.fml.common.FMLCommonHandler;
+ //#endif
+ //#endif
++//#endif
+ 
+ import java.io.IOException;
+ 
+@@ -79,7 +81,7 @@ public class EntityRendererHandler extends EventRegistrations implements WorldRe
+ 
+     public void renderWorld(float partialTicks, int width, int height, long finishTimeNano) {
+         fakeFinishTimeNano = finishTimeNano;
+-        //#if MC>=11400
++        //#if MC>=11400 || FABRIC>=1
+         PreRenderCallback.EVENT.invoker().preRender();
+         //#else
+         //#if MC>=11400
+@@ -176,7 +178,7 @@ public class EntityRendererHandler extends EventRegistrations implements WorldRe
+             }
+         }
+ 
+-        //#if MC>=11400
++        //#if MC>=11400 || FABRIC>=1
+         PostRenderCallback.EVENT.invoker().postRender();
+         //#else
+         //#if MC>=11400
+diff --git a/src/main/java/com/replaymod/render/rendering/VideoRenderer.java b/src/main/java/com/replaymod/render/rendering/VideoRenderer.java
+index 4b8ade5e22..75f0c528e1 100644
+--- a/src/main/java/com/replaymod/render/rendering/VideoRenderer.java
++++ b/src/main/java/com/replaymod/render/rendering/VideoRenderer.java
+@@ -543,11 +543,15 @@ public class VideoRenderer implements RenderInfo {
+         //#endif
+ 
+         //#if MC>=10800 && MC<11400
++        //#if FABRIC<=0
+         //$$ try {
++        //#endif
+         //$$     mc.runTick();
++        //#if FABRIC<=0
+         //$$ } catch (IOException e) {
+         //$$     throw new RuntimeException(e);
+         //$$ }
++        //#endif
+         //#else
+         mc.tick();
+         //#endif
+@@ -680,13 +684,17 @@ public class VideoRenderer implements RenderInfo {
+             // Events are polled on 1.13+ in mainWindow.update which is called later
+             //#if MC<11400
+             //#if MC>=10800
++            //#if FABRIC<=0
+             //$$ try {
++            //#endif
+             //$$     gui.toMinecraft().handleInput();
++            //#if FABRIC<=0
+             //$$ } catch (IOException e) {
+             //$$     // That's a strange exception from this kind of method O_o
+             //$$     // It isn't actually thrown here, so we'll deal with it the easy way
+             //$$     throw new RuntimeException(e);
+             //$$ }
++            //#endif
+             //#else
+             //$$ gui.toMinecraft().handleInput();
+             //#endif
+diff --git a/src/main/java/com/replaymod/replay/InputReplayTimer.java b/src/main/java/com/replaymod/replay/InputReplayTimer.java
+index 475c60961a..b661fe835c 100644
+--- a/src/main/java/com/replaymod/replay/InputReplayTimer.java
++++ b/src/main/java/com/replaymod/replay/InputReplayTimer.java
+@@ -26,9 +26,7 @@ import net.minecraft.client.MinecraftClient;
+ import org.lwjgl.glfw.GLFW;
+ //#else
+ //$$ import net.minecraft.client.settings.KeyBinding;
+-//$$ import net.minecraftforge.client.ForgeHooksClient;
+ //$$ import org.lwjgl.input.Mouse;
+-//$$ import net.minecraftforge.fml.common.FMLCommonHandler;
+ //#if MC>=10800
+ //$$ import java.io.IOException;
+ //#else
+@@ -74,11 +72,15 @@ public class InputReplayTimer {
+             //#else
+             //$$ if (mc.currentScreen != null) {
+                 //#if MC>=10800
++                //#if FABRIC<=0
+                 //$$ try {
++                //#endif
+                 //$$     mc.currentScreen.handleInput();
++                //#if FABRIC<=0
+                 //$$ } catch (IOException e) { // *SIGH*
+                 //$$     e.printStackTrace();
+                 //$$ }
++                //#endif
+                 //#else
+                 //$$ mc.currentScreen.handleInput();
+                 //#endif
+@@ -91,11 +93,15 @@ public class InputReplayTimer {
+                 //$$ // 1.8.9 and below has one giant tick function, so we try to only do keyboard & mouse as far as possible
+                 //$$ ((MCVer.MinecraftMethodAccessor) mc).replayModSetEarlyReturnFromRunTick(true);
+                 //#if MC>=10800
++                //#if FABRIC<=0
+                 //$$ try {
++                //#endif
+                 //$$     mc.runTick();
++                //#if FABRIC<=0
+                 //$$ } catch (IOException e) { // *SIGH*
+                 //$$     e.printStackTrace();
+                 //$$ }
++                //#endif
+                 //#else
+                 //$$ mc.runTick();
+                 //#endif
+diff --git a/src/main/java/com/replaymod/replay/ReplayHandler.java b/src/main/java/com/replaymod/replay/ReplayHandler.java
+index 6ca292f0fa..80d03e00a5 100644
+--- a/src/main/java/com/replaymod/replay/ReplayHandler.java
++++ b/src/main/java/com/replaymod/replay/ReplayHandler.java
+@@ -1,6 +1,10 @@
+ package com.replaymod.replay;
+ 
+ import com.google.common.base.Preconditions;
++//#if MC<11400
++//$$ import com.replaymod.core.events.PreRenderCallback;
++//$$ import de.johni0702.minecraft.gui.utils.EventRegistrations;
++//#endif
+ import com.google.common.util.concurrent.FutureCallback;
+ import com.google.common.util.concurrent.Futures;
+ import com.google.common.util.concurrent.ListenableFuture;
+@@ -125,7 +129,6 @@ import net.minecraft.network.NetworkSide;
+ //#else
+ //$$ import com.mojang.authlib.GameProfile;
+ //$$ import net.minecraft.client.network.NetHandlerPlayClient;
+-//$$ import net.minecraftforge.fml.common.network.handshake.NetworkDispatcher;
+ //#endif
+ //#endif
+ //#else
+@@ -184,6 +187,28 @@ public class ReplayHandler {
+ 
+     private final GuiReplayOverlay overlay;
+ 
++    //#if MC<11400
++    //$$ // The blank screen shown while the world is being re-created, see restartedReplay.
++    //$$ // Vanilla closes it again once the player gets their position, but that doesn't happen on every setup
++    //$$ // (e.g. when other mods skip the terrain loading screen) and the blank screen then blocks the replay GUI.
++    //$$ private net.minecraft.client.gui.GuiScreen restartDummyScreen;
++    //$$ private final EventRegistrations restartDummyScreenCloser = new EventRegistrations() {
++    //$$     {
++    //$$         on(PreRenderCallback.EVENT, () -> {
++    //$$             if (restartDummyScreen == null) {
++    //$$                 return;
++    //$$             }
++    //$$             if (mc.currentScreen != restartDummyScreen) {
++    //$$                 restartDummyScreen = null; // something else took over already
++    //$$             } else if (mc.world != null && mc.player != null) {
++    //$$                 restartDummyScreen = null;
++    //$$                 mc.displayGuiScreen(null);
++    //$$             }
++    //$$         });
++    //$$     }
++    //$$ };
++    //#endif
++
+     private EmbeddedChannel channel;
+ 
+     private int replayDuration;
+@@ -215,6 +240,10 @@ public class ReplayHandler {
+ 
+         ReplayOpenedCallback.EVENT.invoker().replayOpened(this);
+ 
++        //#if MC<11400
++        //$$ restartDummyScreenCloser.register();
++        //#endif
++
+         fullReplaySender.setAsyncMode(asyncMode);
+     }
+ 
+@@ -237,7 +266,8 @@ public class ReplayHandler {
+         //#else
+         //$$ // We need to re-set the GUI screen because having one with `allowsUserInput = true` active during world
+         //$$ // load (i.e. before player is set) will crash MC...
+-        //$$ mc.displayGuiScreen(new net.minecraft.client.gui.GuiScreen() {});
++        //$$ restartDummyScreen = new net.minecraft.client.gui.GuiScreen() {};
++        //$$ mc.displayGuiScreen(restartDummyScreen);
+         //$$ mc.loadWorld(null);
+         //#endif
+ 
+@@ -251,6 +281,10 @@ public class ReplayHandler {
+ 
+         ReplayClosingCallback.EVENT.invoker().replayClosing(this);
+ 
++        //#if MC<11400
++        //$$ restartDummyScreenCloser.unregister();
++        //#endif
++
+         fullReplaySender.terminateReplay();
+         //#if MC>=10800
+         if (quickMode) {
+@@ -346,7 +380,10 @@ public class ReplayHandler {
+         //$$ ChannelOutboundHandlerAdapter dummyHandler = new ChannelOutboundHandlerAdapter();
+         //$$ channel = new EmbeddedChannel(dummyHandler);
+         //$$ channel.pipeline().remove(dummyHandler);
+-        //$$ channel.pipeline().removeLast();
++        //$$ // Netty 4.2 no longer adds a default last handler to EmbeddedChannel, so there might be nothing to remove
++        //$$ if (channel.pipeline().last() != null) {
++        //$$     channel.pipeline().removeLast();
++        //$$ }
+         //#endif
+         channel.pipeline().addFirst("ReplayModReplay_head", new DropOutboundMessagesHandler());
+ 
+@@ -633,6 +670,19 @@ public class ReplayHandler {
+     }
+ 
+     public void doJump(int targetTime, boolean retainCameraPosition) {
++        // Jumping back closes the current screen (and the world reloading replaces any screen opened since), which
++        // the overlay takes to mean that the user closed its input screen, so it would hide the mouse for good.
++        boolean mouseWasVisible = overlay.isMouseVisible();
++        try {
++            doJumpInternal(targetTime, retainCameraPosition);
++        } finally {
++            if (mouseWasVisible && !overlay.isMouseVisible()) {
++                overlay.setMouseVisible(true);
++            }
++        }
++    }
++
++    private void doJumpInternal(int targetTime, boolean retainCameraPosition) {
+         if (!getReplaySender().isAsyncMode()) {
+             return; // path playback, rendering, etc. -> no jumping allowed
+         }
+@@ -661,12 +711,16 @@ public class ReplayHandler {
+             //#if MC>=11400
+             mc.tick();
+             //#else
++            //#if FABRIC<=0
+             //$$ try {
++            //#endif
+             //$$     mc.runTick();
++            //#if FABRIC<=0
+             //$$ } catch (IOException e) {
+             //$$     throw new RuntimeException(e);
+             //$$ }
+             //#endif
++            //#endif
+ 
+             // Jump to target tick
+             quickReplaySender.sendPacketsTill(targetTime);
+@@ -715,11 +769,15 @@ public class ReplayHandler {
+ 
+                     for (int i = 0; i < Math.min(diff / 50, 3); i++) {
+                         //#if MC>=10800 && MC<11400
++                        //#if FABRIC<=0
+                         //$$ try {
++                        //#endif
+                         //$$     mc.runTick();
++                        //#if FABRIC<=0
+                         //$$ } catch (IOException e) {
+                         //$$     e.printStackTrace(); // This should never be thrown but whatever
+                         //$$ }
++                        //#endif
+                         //#else
+                         mc.tick();
+                         //#endif
+@@ -924,11 +982,15 @@ public class ReplayHandler {
+                     entity.prevPitch = entity.pitch;
+                 }
+                 //#if MC>=10800 && MC<11400
++                //#if FABRIC<=0
+                 //$$ try {
++                //#endif
+                 //$$     mc.runTick();
++                //#if FABRIC<=0
+                 //$$ } catch (IOException e) {
+                 //$$     e.printStackTrace(); // This should never be thrown but whatever
+                 //$$ }
++                //#endif
+                 //#else
+                 mc.tick();
+                 //#endif
+diff --git a/src/main/java/com/replaymod/replay/camera/CameraEntity.java b/src/main/java/com/replaymod/replay/camera/CameraEntity.java
+index 7ccfe61306..030ee2b8d9 100644
+--- a/src/main/java/com/replaymod/replay/camera/CameraEntity.java
++++ b/src/main/java/com/replaymod/replay/camera/CameraEntity.java
+@@ -66,7 +66,9 @@ import net.minecraft.tag.Tag;
+ import net.minecraft.util.hit.BlockHitResult;
+ import net.minecraft.util.hit.HitResult;
+ //#else
++//#if FABRIC<=0
+ //$$ import com.replaymod.replay.events.ReplayChatMessageEvent;
++//#endif
+ //$$ import net.minecraft.util.math.RayTraceResult;
+ //$$ import net.minecraft.util.text.ITextComponent;
+ //$$ import net.minecraft.world.World;
+@@ -194,7 +196,7 @@ public class CameraEntity
+         //#if MC>=10900
+         setUuid(CAMERA_UUID);
+         //#else
+-        //$$ entityUniqueID = CAMERA_UUID;
++        //$$ this.entityUniqueID = CAMERA_UUID;
+         //#endif
+         eventHandler.register();
+         if (ReplayModReplay.instance.getReplayHandler().getSpectatedUUID() == null) {
+@@ -476,6 +478,11 @@ public class CameraEntity
+     public boolean shouldRender(double double_1, double double_2, double double_3) {
+         return false; // never render the camera otherwise it'd be visible e.g. in 3rd-person or with shaders
+     }
++    //#elseif FABRIC>=1
++    //$$ @Override
++    //$$ public boolean shouldRender(double x, double y, double z) {
++    //$$     return false; // never render the camera otherwise it'd be visible e.g. in 3rd-person or with shaders
++    //$$ }
+     //#else
+     //$$ @Override
+     //$$ public boolean shouldRenderInPass(int pass) {
+@@ -714,7 +721,7 @@ public class CameraEntity
+     //$$ }
+     //#endif
+ 
+-    //#if MC<11400
++    //#if MC<11400 && FABRIC<=0
+     //$$ @Override
+     //$$ public void openGui(Object mod, int modGuiId, World world, int x, int y, int z) {
+     //$$     // Do not open any block GUIs for the camera entities
+@@ -868,13 +875,17 @@ public class CameraEntity
+     //#if MC>=11102
+     //$$ @Override
+     //$$ public void sendMessage(ITextComponent message) {
++    //#if FABRIC<=0
+     //$$     if (MinecraftForge.EVENT_BUS.post(new ReplayChatMessageEvent(this))) return;
++    //#endif
+     //$$     super.sendMessage(message);
+     //$$ }
+     //#else
+     //$$ @Override
+     //$$ public void addChatMessage(ITextComponent message) {
++    //#if FABRIC<=0
+     //$$     if (MinecraftForge.EVENT_BUS.post(new ReplayChatMessageEvent(this))) return;
++    //#endif
+     //$$     super.addChatMessage(message);
+     //$$ }
+     //#endif
+@@ -962,6 +973,8 @@ public class CameraEntity
+ 
+         //#if MC>=11400
+         // Moved to MixinCamera
++        //#elseif FABRIC>=1
++        // Moved to MixinLegacyCamera
+         //#else
+         //#if MC>=10800
+         //$$ @SubscribeEvent
+diff --git a/src/main/java/com/replaymod/replay/handler/GuiHandler.java b/src/main/java/com/replaymod/replay/handler/GuiHandler.java
+index 290da81f14..15a31d2c79 100644
+--- a/src/main/java/com/replaymod/replay/handler/GuiHandler.java
++++ b/src/main/java/com/replaymod/replay/handler/GuiHandler.java
+@@ -243,14 +243,21 @@ public class GuiHandler extends EventRegistrations {
+         }
+     }
+ 
++    // OneClient replaces the title screen with a Compose based one, which has no buttons that we could add to.
++    private static final String ONECLIENT_MAIN_MENU = "org.polyfrost.polyplus.client.gui.PolyPlusMainMenuScreen";
++
++    private static boolean isOneClientMainMenu(Screen screen) {
++        return screen.getClass().getName().equals(ONECLIENT_MAIN_MENU);
++    }
++
+     { on(InitScreenCallback.EVENT, this::injectIntoMainMenu); }
+     private void injectIntoMainMenu(Screen guiScreen, Collection<AbstractButtonWidget> buttonList) {
+-        if (!(guiScreen instanceof TitleScreen)) {
++        if (!(guiScreen instanceof TitleScreen) && !isOneClientMainMenu(guiScreen)) {
+             return;
+         }
+ 
+         //#if MC>=11604
+-        if (mod.getCore().getSettingsRegistry().get(Setting.LEGACY_MAIN_MENU_BUTTON)) {
++        if (isOneClientMainMenu(guiScreen) || mod.getCore().getSettingsRegistry().get(Setting.LEGACY_MAIN_MENU_BUTTON)) {
+             legacyInjectIntoMainMenu(guiScreen, buttonList);
+         } else {
+             properInjectIntoMainMenu(guiScreen);
+@@ -368,7 +375,8 @@ public class GuiHandler extends EventRegistrations {
+         boolean isCustomMainMenuMod = guiScreen.getClass().getName().endsWith("custommainmenu.gui.GuiFakeMain");
+ 
+         MainMenuButtonPosition buttonPosition = MainMenuButtonPosition.valueOf(mod.getCore().getSettingsRegistry().get(Setting.MAIN_MENU_BUTTON));
+-        if (buttonPosition != MainMenuButtonPosition.BIG && !isCustomMainMenuMod) {
++        boolean isOneClientMenu = isOneClientMainMenu(guiScreen);
++        if (isOneClientMenu || (buttonPosition != MainMenuButtonPosition.BIG && !isCustomMainMenuMod)) {
+             VanillaGuiScreen vanillaGui = VanillaGuiScreen.wrap(guiScreen);
+ 
+             GuiReplayButton replayButton = new GuiReplayButton();
+@@ -382,9 +390,14 @@ public class GuiHandler extends EventRegistrations {
+                 @Override
+                 protected void layout(de.johni0702.minecraft.gui.container.GuiScreen container, int width, int height) {
+                     if (pos == null) {
+-                        // Delaying computation so we can take into account buttons
+-                        // added after our callback.
+-                        pos = determineButtonPos(buttonPosition, guiScreen, buttonList);
++                        if (isOneClientMenu) {
++                            // Bottom centre is the one spot of that menu which is always empty
++                            pos = new Point(width / 2 - 10, height - 26);
++                        } else {
++                            // Delaying computation so we can take into account buttons
++                            // added after our callback.
++                            pos = determineButtonPos(buttonPosition, guiScreen, buttonList);
++                        }
+                     }
+                     size(replayButton, 20, 20);
+                     pos(replayButton, pos.getX(), pos.getY());
+@@ -517,7 +530,7 @@ public class GuiHandler extends EventRegistrations {
+         return bestIndex;
+     }
+ 
+-    //#if MC>=11400
++    //#if MC>=11400 || FABRIC>=1
+     private void onButton(InjectedButton button) {
+         Screen guiScreen = button.guiScreen;
+     //#else
+@@ -560,7 +573,7 @@ public class GuiHandler extends EventRegistrations {
+         private Consumer<InjectedButton> onClick;
+         public InjectedButton(Screen guiScreen, int buttonId, int x, int y, int width, int height, String buttonText,
+                               String tooltip,
+-                              //#if MC>=11400
++                              //#if MC>=11400 || FABRIC>=1
+                               Consumer<InjectedButton> onClick
+                               //#else
+                               //$$ Consumer<GuiScreenEvent.ActionPerformedEvent.Pre> onClick
+@@ -593,7 +606,7 @@ public class GuiHandler extends EventRegistrations {
+             );
+             this.guiScreen = guiScreen;
+             this.id = buttonId;
+-            //#if MC>=11400
++            //#if MC>=11400 || FABRIC>=1
+             this.onClick = onClick;
+             //#else
+             //$$ this.onClick = null;
+@@ -612,6 +625,18 @@ public class GuiHandler extends EventRegistrations {
+         //$$     onClick.accept(this);
+         //$$ }
+         //#endif
++
++        // Legacy Fabric: there's no event for button clicks, so we do what the 1.14+ buttons do and call ourselves
++        //#if FABRIC>=1 && MC<11400
++        //$$ @Override
++        //$$ public boolean isMouseOver(net.minecraft.client.MinecraftClient client, int mouseX, int mouseY) {
++        //$$     boolean pressed = super.isMouseOver(client, mouseX, mouseY);
++        //$$     if (pressed) {
++        //$$         onClick.accept(this);
++        //$$     }
++        //$$     return pressed;
++        //$$ }
++        //#endif
+     }
+ 
+     public enum MainMenuButtonPosition {
+diff --git a/src/main/java/com/replaymod/simplepathing/gui/GuiPathing.java b/src/main/java/com/replaymod/simplepathing/gui/GuiPathing.java
+index 560d5d4bd5..b2166683d4 100644
+--- a/src/main/java/com/replaymod/simplepathing/gui/GuiPathing.java
++++ b/src/main/java/com/replaymod/simplepathing/gui/GuiPathing.java
+@@ -57,11 +57,6 @@ import org.apache.logging.log4j.Logger;
+ //#if MC>=11400
+ //#else
+ //$$ import org.lwjgl.input.Keyboard;
+-//#if MC>=10800
+-//$$ import net.minecraftforge.fml.common.Loader;
+-//#else
+-//$$ import cpw.mods.fml.common.Loader;
+-//#endif
+ //#endif
+ 
+ import javax.annotation.Nonnull;
+diff --git a/src/main/resources/mixins.compat.mapwriter.replaymod.json b/src/main/resources/mixins.compat.mapwriter.replaymod.json
+index ac038ec8c9..ac9d3c43b8 100644
+--- a/src/main/resources/mixins.compat.mapwriter.replaymod.json
++++ b/src/main/resources/mixins.compat.mapwriter.replaymod.json
+@@ -4,7 +4,7 @@
+   "mixins": [],
+   "server": [],
+   "client": [
+-    //#if MC<11400
++    //#if MC<11400 && FABRIC<=0
+     //$$ "MixinMinecraft"
+     //#endif
+   ],
+diff --git a/src/main/resources/mixins.compat.shaders.replaymod.json b/src/main/resources/mixins.compat.shaders.replaymod.json
+index b2826f7f83..4570cfbc17 100644
+--- a/src/main/resources/mixins.compat.shaders.replaymod.json
++++ b/src/main/resources/mixins.compat.shaders.replaymod.json
+@@ -4,6 +4,7 @@
+   "mixins": [],
+   "server": [],
+   "client": [
++    //#if FABRIC<=0 || MC>=11400
+     //#if MC>=11500
+     "MixinChunkVisibility",
+     //#endif
+@@ -16,6 +17,7 @@
+     //$$ "MixinShaders",
+     //#endif
+     "MixinShadersRender"
++    //#endif
+   ],
+   "compatibilityLevel": "JAVA_8",
+   "minVersion": "0.6.11",
+diff --git a/src/main/resources/mixins.core.replaymod.json b/src/main/resources/mixins.core.replaymod.json
+index 48f8d11ca1..ac59116948 100644
+--- a/src/main/resources/mixins.core.replaymod.json
++++ b/src/main/resources/mixins.core.replaymod.json
+@@ -11,6 +11,14 @@
+     //$$ "GuiAccessor",
+     //#endif
+     "Mixin_ContextualKeyBindings",
++    //#if FABRIC>=1 && MC<11400
++    //$$ "MixinLegacyGameRenderer",
++    //$$ "MixinLegacyInGameHud",
++    //$$ "MixinLegacySpectatorHud",
++    //$$ "GameOptionsAccessor",
++    //$$ "MixinLegacyGameOptions",
++    //$$ "MixinLegacyScroll",
++    //#endif
+     //#if MC>=11400
+     "AbstractButtonWidgetAccessor",
+     "Mixin_PostRenderWorldCalback",
+diff --git a/src/main/resources/mixins.recording.replaymod.json b/src/main/resources/mixins.recording.replaymod.json
+index db885b0f74..0082c491ae 100644
+--- a/src/main/resources/mixins.recording.replaymod.json
++++ b/src/main/resources/mixins.recording.replaymod.json
+@@ -37,9 +37,12 @@
+     //#if MC>=12006
+     //$$ "MixinNetHandlerConfigClient",
+     //#endif
++    //#if FABRIC>=1 && MC<11400
++    //$$ "MixinLegacyCustomPayload",
++    //#endif
+     "MixinNetHandlerLoginClient",
+     "MixinNetHandlerPlayClient",
+-    //#if MC<11400
++    //#if MC<11400 && FABRIC<=0
+     //$$ "MixinNetworkDispatcher",
+     //#endif
+     "MixinRenderGlobal"
+diff --git a/src/main/resources/mixins.replay.replaymod.json b/src/main/resources/mixins.replay.replaymod.json
+index 7310c10524..757cf14b86 100644
+--- a/src/main/resources/mixins.replay.replaymod.json
++++ b/src/main/resources/mixins.replay.replaymod.json
+@@ -5,6 +5,9 @@
+   "mixins": [],
+   "server": [],
+   "client": [
++    //#if FABRIC>=1 && MC<11400
++    //$$ "MixinLegacyCamera",
++    //#endif
+     "entity_tracking.Mixin_EntityExt",
+     "entity_tracking.Mixin_FixPartialUpdates",
+     "world_border.Mixin_UseReplayTime_ForMovement",
+diff --git a/tools/OrnitheRetarget.java b/tools/OrnitheRetarget.java
+new file mode 100644
+index 0000000000..460d1ccf3c
+--- /dev/null
++++ b/tools/OrnitheRetarget.java
+@@ -0,0 +1,245 @@
++import net.fabricmc.tinyremapper.OutputConsumerPath;
++import net.fabricmc.tinyremapper.TinyRemapper;
++import net.fabricmc.tinyremapper.TinyUtils;
++import net.fabricmc.tinyremapper.extension.mixin.MixinExtension;
++import net.fabricmc.tinyremapper.extension.mixin.common.Logger;
++import org.objectweb.asm.AnnotationVisitor;
++import org.objectweb.asm.ClassReader;
++import org.objectweb.asm.ClassVisitor;
++import org.objectweb.asm.ClassWriter;
++import org.objectweb.asm.Opcodes;
++
++import java.io.IOException;
++import java.io.OutputStream;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.Enumeration;
++import java.util.HashMap;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipFile;
++import java.util.zip.ZipOutputStream;
++
++/**
++ * Converts a mod jar that was remapped to Legacy Fabric's intermediary names to Ornithe's (calamus gen2) names.
++ * <p>
++ * Both intermediaries are generated from the same obfuscated Minecraft jar, so the names of one can be translated
++ * to the other via the obfuscated names.
++ * <p>
++ * Usage (java source launcher, tiny-remapper on the classpath):
++ * {@code OrnitheRetarget.java <in.jar> <out.jar> <legacy-fabric-intermediary.jar> <calamus-gen2.jar> <minecraft-client.jar>}
++ * where the last one is the obfuscated Minecraft jar.
++ */
++public class OrnitheRetarget {
++    private static final String MAPPINGS = "mappings/mappings.tiny";
++
++    public static void main(String[] args) throws Exception {
++        if (args.length != 5) {
++            throw new IllegalArgumentException("expected: <in> <out> <lf-intermediary.jar> <calamus.jar> <minecraft.jar>");
++        }
++        Path in = Paths.get(args[0]), out = Paths.get(args[1]);
++        Path work = Files.createTempDirectory("ornithe-retarget");
++        try {
++            String lfTiny = readEntry(Paths.get(args[2]), MAPPINGS);
++            String calamusTiny = readEntry(Paths.get(args[3]), MAPPINGS);
++            Path lfFile = work.resolve("lf.tiny");
++            Files.write(lfFile, lfTiny.getBytes(StandardCharsets.UTF_8));
++
++            Joined joined = join(lfTiny, calamusTiny);
++            Path joinedFile = work.resolve("lf2ornithe.tiny");
++            Files.write(joinedFile, joined.tiny.getBytes(StandardCharsets.UTF_8));
++
++            // Minecraft in Legacy Fabric names, needed to resolve the inheritance of the members the mod uses
++            Path minecraftLf = work.resolve("minecraft-lf.jar");
++            remap(Paths.get(args[4]), minecraftLf, lfFile, "official", "intermediary", null, false);
++
++            Path remapped = work.resolve("remapped.jar");
++            remap(in, remapped, joinedFile, "intermediary", "ornithe", minecraftLf, true);
++
++            postProcess(remapped, out, joined);
++        } finally {
++            try (java.util.stream.Stream<Path> files = Files.walk(work)) {
++                files.sorted(Collections.reverseOrder()).forEach(p -> p.toFile().delete());
++            }
++        }
++    }
++
++    private static String readEntry(Path jar, String name) throws IOException {
++        try (ZipFile zf = new ZipFile(jar.toFile())) {
++            ZipEntry e = zf.getEntry(name);
++            if (e == null) throw new IOException(name + " not found in " + jar);
++            return new String(zf.getInputStream(e).readAllBytes(), StandardCharsets.UTF_8);
++        }
++    }
++
++    private static void remap(Path in, Path out, Path mappings, String from, String to, Path classpath, boolean mixins) throws IOException {
++        TinyRemapper.Builder builder = TinyRemapper.newRemapper()
++                .withMappings(TinyUtils.createTinyMappingProvider(mappings, from, to));
++        if (mixins) builder.extension(new MixinExtension(Logger.Level.ERROR));
++        TinyRemapper remapper = builder.build();
++        try (OutputConsumerPath consumer = new OutputConsumerPath.Builder(out).build()) {
++            consumer.addNonClassFiles(in);
++            remapper.readInputs(in);
++            if (classpath != null) remapper.readClassPath(classpath);
++            remapper.apply(consumer);
++        } finally {
++            remapper.finish();
++        }
++    }
++
++    private static class Joined {
++        String tiny;
++        final Map<String, String> classes = new HashMap<>(); // LF class -> ornithe class
++        final Map<String, String> methods = new HashMap<>(); // LF method_123 -> ornithe name
++        final Map<String, String> fields = new HashMap<>();  // LF field_123 -> ornithe name
++    }
++
++    private static Joined join(String lfTiny, String calamusTiny) {
++        // official -> LF
++        Map<String, String> lfClasses = new LinkedHashMap<>();
++        List<String[]> lfMembers = new ArrayList<>(); // kind, owner (official), name (official), desc (official), LF name
++        String cur = null;
++        for (String line : lfTiny.split("\n")) {
++            String[] p = line.split("\t", -1);
++            if (p[0].equals("c")) {
++                cur = p[1];
++                lfClasses.put(cur, p[2]);
++            } else if (p[0].isEmpty() && p.length >= 5 && (p[1].equals("m") || p[1].equals("f"))) {
++                lfMembers.add(new String[]{p[1], cur, p[3], p[2], p[4]});
++            }
++        }
++        // official -> ornithe (calamus is a v1 file with official names)
++        Map<String, String> calClasses = new HashMap<>();
++        Map<String, String> calMembers = new HashMap<>();
++        for (String line : calamusTiny.split("\n")) {
++            String[] p = line.split("\t", -1);
++            if (p[0].equals("CLASS")) {
++                calClasses.put(p[1], p[2]);
++            } else if (p[0].equals("FIELD")) {
++                calMembers.put("f\t" + p[1] + "\t" + p[3] + "\t" + p[2], p[4]);
++            } else if (p[0].equals("METHOD")) {
++                calMembers.put("m\t" + p[1] + "\t" + p[3] + "\t" + p[2], p[4]);
++            }
++        }
++
++        Joined j = new Joined();
++        Map<String, List<String[]>> byOwner = new HashMap<>();
++        for (String[] m : lfMembers) byOwner.computeIfAbsent(m[1], k -> new ArrayList<>()).add(m);
++        Pattern classRef = Pattern.compile("L([^;]+);");
++        StringBuilder sb = new StringBuilder("tiny\t2\t0\tintermediary\tornithe\n");
++        for (Map.Entry<String, String> c : lfClasses.entrySet()) {
++            String ornithe = calClasses.getOrDefault(c.getKey(), c.getKey());
++            j.classes.put(c.getValue(), ornithe);
++            sb.append("c\t").append(c.getValue()).append('\t').append(ornithe).append('\n');
++            for (String[] m : byOwner.getOrDefault(c.getKey(), Collections.emptyList())) {
++                Matcher matcher = classRef.matcher(m[3]);
++                StringBuilder desc = new StringBuilder();
++                while (matcher.find()) {
++                    matcher.appendReplacement(desc, Matcher.quoteReplacement("L" + lfClasses.getOrDefault(matcher.group(1), matcher.group(1)) + ";"));
++                }
++                matcher.appendTail(desc);
++                String newName = calMembers.getOrDefault(m[0] + "\t" + m[1] + "\t" + m[2] + "\t" + m[3], m[2]);
++                sb.append('\t').append(m[0]).append('\t').append(desc).append('\t').append(m[4]).append('\t').append(newName).append('\n');
++                (m[0].equals("m") ? j.methods : j.fields).putIfAbsent(m[4], newName);
++            }
++        }
++        j.tiny = sb.toString();
++        return j;
++    }
++
++    private static final Pattern CLASS_TOKEN = Pattern.compile("net/minecraft/class_\\d+(?:\\$[\\w$]+)?");
++    private static final Pattern METHOD_TOKEN = Pattern.compile("\\bmethod_\\d+\\b");
++    private static final Pattern FIELD_TOKEN = Pattern.compile("\\bfield_\\d+\\b");
++    private static final Pattern REFMAP_CLASS = Pattern.compile("\"(net\\.minecraft\\.[^\"]+)\"\\s*:\\s*\"(net/minecraft/[^\";:(]+)\"");
++
++    private static String convertTokens(String text, Joined j) {
++        text = replaceAll(CLASS_TOKEN, text, t -> j.classes.getOrDefault(t, t));
++        text = replaceAll(METHOD_TOKEN, text, t -> j.methods.getOrDefault(t, t));
++        return replaceAll(FIELD_TOKEN, text, t -> j.fields.getOrDefault(t, t));
++    }
++
++    private static String replaceAll(Pattern pattern, String text, java.util.function.Function<String, String> f) {
++        Matcher m = pattern.matcher(text);
++        StringBuilder sb = new StringBuilder();
++        while (m.find()) m.appendReplacement(sb, Matcher.quoteReplacement(f.apply(m.group())));
++        m.appendTail(sb);
++        return sb.toString();
++    }
++
++    /**
++     * Mixin refmaps and access wideners reference members by name; the targets of Mixins declared with a string
++     * have to match the refmap.
++     */
++    private static void postProcess(Path in, Path out, Joined j) throws IOException {
++        Map<String, String> targets = new HashMap<>();
++        Map<String, byte[]> converted = new HashMap<>();
++        try (ZipFile zf = new ZipFile(in.toFile())) {
++            for (Enumeration<? extends ZipEntry> e = zf.entries(); e.hasMoreElements(); ) {
++                ZipEntry ze = e.nextElement();
++                String name = ze.getName();
++                if (name.endsWith(".refmap.json") || name.endsWith(".accesswidener")) {
++                    String text = convertTokens(new String(zf.getInputStream(ze).readAllBytes(), StandardCharsets.UTF_8), j);
++                    converted.put(name, text.getBytes(StandardCharsets.UTF_8));
++                    Matcher m = REFMAP_CLASS.matcher(text);
++                    while (m.find()) targets.put(m.group(1), m.group(2));
++                }
++            }
++        }
++        int[] rewritten = {0};
++        try (ZipFile zf = new ZipFile(in.toFile()); OutputStream os = Files.newOutputStream(out); ZipOutputStream zo = new ZipOutputStream(os)) {
++            for (Enumeration<? extends ZipEntry> e = zf.entries(); e.hasMoreElements(); ) {
++                ZipEntry ze = e.nextElement();
++                byte[] data = converted.containsKey(ze.getName()) ? converted.get(ze.getName()) : zf.getInputStream(ze).readAllBytes();
++                if (ze.getName().endsWith(".class") && !targets.isEmpty()) data = fixMixinTargets(data, targets, rewritten);
++                ZipEntry ne = new ZipEntry(ze.getName());
++                zo.putNextEntry(ne);
++                zo.write(data);
++                zo.closeEntry();
++            }
++        }
++        System.out.println("Wrote " + out.getFileName() + " with Ornithe names (" + rewritten[0] + " mixin target strings rewritten)");
++    }
++
++    private static byte[] fixMixinTargets(byte[] classFile, Map<String, String> targets, int[] rewritten) {
++        ClassReader reader = new ClassReader(classFile);
++        ClassWriter writer = new ClassWriter(0);
++        boolean[] changed = {false};
++        reader.accept(new ClassVisitor(Opcodes.ASM9, writer) {
++            @Override
++            public AnnotationVisitor visitAnnotation(String desc, boolean visible) {
++                AnnotationVisitor av = super.visitAnnotation(desc, visible);
++                if (!desc.equals("Lorg/spongepowered/asm/mixin/Mixin;")) return av;
++                return new AnnotationVisitor(Opcodes.ASM9, av) {
++                    @Override
++                    public AnnotationVisitor visitArray(String name) {
++                        AnnotationVisitor array = super.visitArray(name);
++                        if (!"targets".equals(name)) return array;
++                        return new AnnotationVisitor(Opcodes.ASM9, array) {
++                            @Override
++                            public void visit(String n, Object value) {
++                                if (value instanceof String) {
++                                    String replacement = targets.get(((String) value).replace('/', '.'));
++                                    if (replacement != null) {
++                                        value = replacement;
++                                        changed[0] = true;
++                                        rewritten[0]++;
++                                    }
++                                }
++                                super.visit(n, value);
++                            }
++                        };
++                    }
++                };
++            }
++        }, 0);
++        return changed[0] ? writer.toByteArray() : classFile;
++    }
++}
+diff --git a/versions/1.12.2/src/main/java/com/replaymod/compat/mapwriter/mixin/MixinMinecraft.java b/versions/1.12.2/src/main/java/com/replaymod/compat/mapwriter/mixin/MixinMinecraft.java
+index 7a4a792c82..019899c234 100644
+--- a/versions/1.12.2/src/main/java/com/replaymod/compat/mapwriter/mixin/MixinMinecraft.java
++++ b/versions/1.12.2/src/main/java/com/replaymod/compat/mapwriter/mixin/MixinMinecraft.java
+@@ -26,7 +26,7 @@ public abstract class MixinMinecraft {
+ 
+     @Inject(method = "getCurrentServerData", cancellable = true, at = @At("HEAD"))
+     private void replayModCompat_fixBug96(CallbackInfoReturnable<ServerData> ci) {
+-        if (currentServerData == null
++        if (this.currentServerData == null
+                 && (Loader.isModLoaded("mapwriter") || Loader.isModLoaded("MapWriter"))
+                 && ReplayModReplay.instance.getReplayHandler() != null) {
+             for (StackTraceElement elem : Thread.currentThread().getStackTrace()) {
+diff --git a/versions/1.12.2/src/main/java/com/replaymod/core/versions/Window.java b/versions/1.12.2/src/main/java/com/replaymod/core/versions/Window.java
+index 3f6206193e..5a5c2aca71 100644
+--- a/versions/1.12.2/src/main/java/com/replaymod/core/versions/Window.java
++++ b/versions/1.12.2/src/main/java/com/replaymod/core/versions/Window.java
+@@ -2,7 +2,6 @@ package com.replaymod.core.versions;
+ 
+ import com.replaymod.render.mixin.MainWindowAccessor;
+ import net.minecraft.client.Minecraft;
+-import net.minecraft.client.gui.ScaledResolution;
+ import org.lwjgl.opengl.Display;
+ 
+ public class Window implements MainWindowAccessor {
+@@ -45,11 +44,11 @@ public class Window implements MainWindowAccessor {
+         return Display.getHeight();
+     }
+ 
+-    private ScaledResolution scaledResolution() {
++    private net.minecraft.client.gui.ScaledResolution scaledResolution() {
+         //#if MC>=10809
+-        return new ScaledResolution(mc);
++        return new net.minecraft.client.gui.ScaledResolution(mc);
+         //#else
+-        //$$ return new ScaledResolution(mc, mc.displayWidth, mc.displayHeight);
++        //$$ return new net.minecraft.client.gui.ScaledResolution(mc, mc.displayWidth, mc.displayHeight);
+         //#endif
+     }
+ 
+diff --git a/versions/1.12.2/src/main/java/com/replaymod/core/versions/forge/Patterns.java b/versions/1.12.2/src/main/java/com/replaymod/core/versions/forge/Patterns.java
+index 0f8a6ff35b..2f611a03fd 100644
+--- a/versions/1.12.2/src/main/java/com/replaymod/core/versions/forge/Patterns.java
++++ b/versions/1.12.2/src/main/java/com/replaymod/core/versions/forge/Patterns.java
+@@ -4,54 +4,86 @@ import com.replaymod.gradle.remap.Pattern;
+ import net.minecraft.client.gui.GuiButton;
+ import net.minecraft.client.gui.GuiScreen;
+ import net.minecraft.entity.EntityLivingBase;
++//#if FABRIC<=0
+ import net.minecraftforge.client.event.GuiScreenEvent;
+ import net.minecraftforge.client.event.RenderGameOverlayEvent;
+ import net.minecraftforge.client.event.RenderLivingEvent;
+ import net.minecraftforge.common.config.Property;
++//#endif
+ 
+ class Patterns {
+     @Pattern
++    //#if FABRIC<=0
+     private static GuiButton getButton(GuiScreenEvent.ActionPerformedEvent event) {
++    //#else
++    //$$ private static void getButton(Object event) {
++    //#endif
++        //#if FABRIC<=0
+         //#if MC>=10904
+         return event.getButton();
+         //#else
+         //$$ return event.button;
+         //#endif
++        //#endif
+     }
+ 
+     @Pattern
++    //#if FABRIC<=0
+     private static GuiScreen getGui(GuiScreenEvent event) {
++    //#else
++    //$$ private static void getGui(Object event) {
++    //#endif
++        //#if FABRIC<=0
+         //#if MC>=10904
+         return event.getGui();
+         //#else
+         //$$ return event.gui;
+         //#endif
++        //#endif
+     }
+ 
+     @Pattern
++    //#if FABRIC<=0
+     private static EntityLivingBase getEntity(RenderLivingEvent event) {
++    //#else
++    //$$ private static void getEntity(Object event) {
++    //#endif
++        //#if FABRIC<=0
+         //#if MC>=10904
+         return event.getEntity();
+         //#else
+         //$$ return event.entity;
+         //#endif
++        //#endif
+     }
+ 
+     @Pattern
++    //#if FABRIC<=0
+     private static RenderGameOverlayEvent.ElementType getType(RenderGameOverlayEvent event) {
++    //#else
++    //$$ private static void getType(Object event) {
++    //#endif
++        //#if FABRIC<=0
+         //#if MC>=10904
+         return event.getType();
+         //#else
+         //$$ return event.type;
+         //#endif
++        //#endif
+     }
+ 
+     @Pattern
++    //#if FABRIC<=0
+     private static void setComment(Property property, String comment) {
++    //#else
++    //$$ private static void setComment(Object comment) {
++    //#endif
++        //#if FABRIC<=0
+         //#if MC>=10900
+         property.setComment(comment);
+         //#else
+         //$$ property.comment = comment;
+         //#endif
++        //#endif
+     }
+ }
+diff --git a/versions/1.12.2/src/main/java/com/replaymod/core/versions/scheduler/SchedulerImpl.java b/versions/1.12.2/src/main/java/com/replaymod/core/versions/scheduler/SchedulerImpl.java
+index 65444afcf9..5bb1e10f7c 100644
+--- a/versions/1.12.2/src/main/java/com/replaymod/core/versions/scheduler/SchedulerImpl.java
++++ b/versions/1.12.2/src/main/java/com/replaymod/core/versions/scheduler/SchedulerImpl.java
+@@ -4,9 +4,14 @@ import com.google.common.util.concurrent.ListenableFutureTask;
+ import com.replaymod.core.mixin.MinecraftAccessor;
+ import net.minecraft.client.Minecraft;
+ import net.minecraft.util.ReportedException;
++//#if FABRIC>=1
++//$$ import com.replaymod.core.events.PreRenderCallback;
++//$$ import de.johni0702.minecraft.gui.utils.EventRegistrations;
++//#else
+ import net.minecraftforge.fml.common.eventhandler.EventBus;
+ import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
+ import net.minecraftforge.fml.common.gameevent.TickEvent;
++//#endif
+ 
+ import java.util.Queue;
+ import java.util.concurrent.ExecutionException;
+@@ -14,7 +19,8 @@ import java.util.concurrent.FutureTask;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.TimeoutException;
+ 
+-//#if MC>=10809
++//#if FABRIC>=1
++//#elseif MC>=10809
+ import net.minecraftforge.common.MinecraftForge;
+ //#else
+ //$$ import net.minecraftforge.fml.common.FMLCommonHandler;
+@@ -27,7 +33,8 @@ import net.minecraftforge.common.MinecraftForge;
+ public class SchedulerImpl implements  Scheduler {
+     private static final Minecraft mc = Minecraft.getMinecraft();
+ 
+-    //#if MC>=10809
++    //#if FABRIC>=1
++    //#elseif MC>=10809
+     private static final EventBus FML_BUS = MinecraftForge.EVENT_BUS;
+     //#else
+     //$$ private static final EventBus FML_BUS = FMLCommonHandler.instance().bus();
+@@ -67,7 +74,16 @@ public class SchedulerImpl implements  Scheduler {
+ 
+     private void runLater(Runnable runnable, Runnable defer) {
+         if (mc.isCallingFromMinecraftThread() && inRunLater) {
+-            //#if MC>=10800
++            //#if FABRIC>=1
++            //$$ new EventRegistrations() {
++            //$$     {
++            //$$         on(PreRenderCallback.EVENT, () -> {
++            //$$             unregister();
++            //$$             defer.run();
++            //$$         });
++            //$$     }
++            //$$ }.register();
++            //#elseif MC>=10800
+             FML_BUS.register(new Object() {
+                 @SubscribeEvent
+                 public void onRenderTick(TickEvent.RenderTickEvent event) {
+diff --git a/versions/1.14.4/src/main/java/com/replaymod/render/hooks/ForceChunkLoadingHook.java b/versions/1.14.4/src/main/java/com/replaymod/render/hooks/ForceChunkLoadingHook.java
+index 181c7fc10c..3e3ebc8710 100644
+--- a/versions/1.14.4/src/main/java/com/replaymod/render/hooks/ForceChunkLoadingHook.java
++++ b/versions/1.14.4/src/main/java/com/replaymod/render/hooks/ForceChunkLoadingHook.java
+@@ -5,7 +5,6 @@ import com.replaymod.render.mixin.WorldRendererAccessor;
+ import com.replaymod.render.utils.JailingQueue;
+ import net.minecraft.client.render.WorldRenderer;
+ import net.minecraft.client.render.chunk.BlockBufferBuilderStorage;
+-import net.minecraft.client.render.chunk.ChunkBuilder;
+ import net.minecraft.client.render.chunk.ChunkRenderTask;
+ import net.minecraft.client.render.chunk.ChunkRenderWorker;
+ import net.minecraft.client.render.chunk.ChunkRenderer;
+@@ -24,7 +23,7 @@ public class ForceChunkLoadingHook {
+ 
+     private final WorldRenderer hooked;
+ 
+-    private ChunkBuilder renderDispatcher;
++    private net.minecraft.client.render.chunk.ChunkBuilder renderDispatcher;
+     //#if MC>=11400
+     private JailingQueue<ChunkRenderTask> workerJailingQueue;
+     //#else
+@@ -40,7 +39,7 @@ public class ForceChunkLoadingHook {
+         IForceChunkLoading.from(renderGlobal).replayModRender_setHook(this);
+     }
+ 
+-    public void updateRenderDispatcher(ChunkBuilder renderDispatcher) {
++    public void updateRenderDispatcher(net.minecraft.client.render.chunk.ChunkBuilder renderDispatcher) {
+         if (this.renderDispatcher != null) {
+             workerJailingQueue.freeAll();
+             this.renderDispatcher = null;
+@@ -50,7 +49,7 @@ public class ForceChunkLoadingHook {
+         }
+     }
+ 
+-    private void setup(ChunkBuilder renderDispatcher) {
++    private void setup(net.minecraft.client.render.chunk.ChunkBuilder renderDispatcher) {
+         this.renderDispatcher = renderDispatcher;
+         this.renderWorker = (ChunkRenderWorkerAccessor) new ChunkRenderWorker(renderDispatcher, new BlockBufferBuilderStorage());
+         ChunkRenderDispatcherAccessor renderDispatcherAcc = (ChunkRenderDispatcherAccessor) renderDispatcher;
+diff --git a/versions/1.14.4/src/main/java/com/replaymod/render/mixin/ChunkRenderDispatcherAccessor.java b/versions/1.14.4/src/main/java/com/replaymod/render/mixin/ChunkRenderDispatcherAccessor.java
+index 2c62b138f7..3923f55818 100644
+--- a/versions/1.14.4/src/main/java/com/replaymod/render/mixin/ChunkRenderDispatcherAccessor.java
++++ b/versions/1.14.4/src/main/java/com/replaymod/render/mixin/ChunkRenderDispatcherAccessor.java
+@@ -1,7 +1,6 @@
+ //#if MC>=10800
+ package com.replaymod.render.mixin;
+ 
+-import net.minecraft.client.render.chunk.ChunkBuilder;
+ import net.minecraft.client.render.chunk.ChunkRenderTask;
+ import net.minecraft.client.render.chunk.ChunkRenderWorker;
+ import org.spongepowered.asm.mixin.Mixin;
+@@ -14,7 +13,7 @@ import java.util.concurrent.PriorityBlockingQueue;
+ //$$ import java.util.concurrent.BlockingQueue;
+ //#endif
+ 
+-@Mixin(ChunkBuilder.class)
++@Mixin(net.minecraft.client.render.chunk.ChunkBuilder.class)
+ public interface ChunkRenderDispatcherAccessor {
+     @Accessor("workers")
+     List<ChunkRenderWorker> getListThreadedWorkers();
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/compat/bettersprinting/DisableBetterSprinting.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/compat/bettersprinting/DisableBetterSprinting.java
+new file mode 100644
+index 0000000000..c690defcd7
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/compat/bettersprinting/DisableBetterSprinting.java
+@@ -0,0 +1 @@
++// Forge only
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/compat/mapwriter/mixin/MixinMinecraft.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/compat/mapwriter/mixin/MixinMinecraft.java
+new file mode 100644
+index 0000000000..c690defcd7
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/compat/mapwriter/mixin/MixinMinecraft.java
+@@ -0,0 +1 @@
++// Forge only
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/compat/oranges17animations/HideInvisibleEntities.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/compat/oranges17animations/HideInvisibleEntities.java
+new file mode 100644
+index 0000000000..c690defcd7
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/compat/oranges17animations/HideInvisibleEntities.java
+@@ -0,0 +1 @@
++// Forge only
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/compat/shaders/mixin/MixinShadersRender.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/compat/shaders/mixin/MixinShadersRender.java
+new file mode 100644
+index 0000000000..1f46736f7c
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/compat/shaders/mixin/MixinShadersRender.java
+@@ -0,0 +1 @@
++// Not applicable to Legacy Fabric
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/core/LoadingPlugin.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/LoadingPlugin.java
+new file mode 100644
+index 0000000000..c690defcd7
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/LoadingPlugin.java
+@@ -0,0 +1 @@
++// Forge only
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/core/ReplayModBackend.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/ReplayModBackend.java
+new file mode 100644
+index 0000000000..e3fbf3223e
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/ReplayModBackend.java
+@@ -0,0 +1,45 @@
++package com.replaymod.core;
++
++import com.replaymod.core.mixin.MinecraftAccessor;
++import net.fabricmc.api.ClientModInitializer;
++import net.fabricmc.loader.api.FabricLoader;
++import net.minecraft.client.MinecraftClient;
++
++import java.util.List;
++
++import static com.replaymod.core.ReplayMod.MOD_ID;
++
++public class ReplayModBackend implements ClientModInitializer {
++    private final ReplayMod mod = new ReplayMod(this);
++
++    @Override
++    public void onInitializeClient() {
++        mod.initModules();
++        com.replaymod.core.oneconfig.OneConfigSupport.registerIfPresent();
++    }
++
++    public String getVersion() {
++        return FabricLoader.getInstance().getModContainer(MOD_ID)
++                .orElseThrow(IllegalStateException::new)
++                .getMetadata().getVersion().toString();
++    }
++
++    public String getMinecraftVersion() {
++        return FabricLoader.getInstance().getModContainer("minecraft")
++                .orElseThrow(IllegalStateException::new)
++                .getMetadata().getVersion().getFriendlyString();
++    }
++
++    public boolean isModLoaded(String id) {
++        return FabricLoader.getInstance().isModLoaded(id.toLowerCase());
++    }
++
++    static {
++        // Only set in the development environment, where jGui's resources are not part of the mod jar.
++        // (Has to happen before the first resource reload, so it can't wait for the entrypoint to be called.)
++        if (ReplayMod.jGuiResourcePack != null) {
++            //noinspection unchecked,rawtypes
++            ((List) ((MinecraftAccessor) MinecraftClient.getInstance()).getDefaultResourcePacks()).add(ReplayMod.jGuiResourcePack);
++        }
++    }
++}
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/core/SettingsRegistryBackend.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/SettingsRegistryBackend.java
+new file mode 100644
+index 0000000000..3a8a9e4a55
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/SettingsRegistryBackend.java
+@@ -0,0 +1,189 @@
++package com.replaymod.core;
++
++import com.google.gson.Gson;
++import com.google.gson.GsonBuilder;
++import com.google.gson.JsonArray;
++import com.google.gson.JsonElement;
++import com.google.gson.JsonObject;
++import com.google.gson.JsonPrimitive;
++import com.replaymod.core.events.SettingsChangedCallback;
++import net.minecraft.client.MinecraftClient;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardWatchEventKinds;
++import java.nio.file.WatchEvent;
++import java.nio.file.WatchKey;
++import java.nio.file.WatchService;
++import java.util.List;
++import java.util.Map;
++
++import static com.replaymod.core.utils.Utils.ensureDirectoryExists;
++import static com.replaymod.core.versions.MCVer.getMinecraft;
++
++class SettingsRegistryBackend {
++    private static final Logger LOGGER = LogManager.getLogger();
++    private final Map<SettingsRegistry.SettingKey<?>, Object> settings;
++
++    private final Path configFile = getMinecraft().runDirectory.toPath().resolve("config/replaymod.json");
++
++    SettingsRegistryBackend(Map<SettingsRegistry.SettingKey<?>, Object> settings) {
++        this.settings = settings;
++    }
++
++    public void register() {
++        load(true);
++        try {
++            registerWatcher();
++        } catch (IOException e) {
++            LOGGER.warn("Failed to setup file watcher for {}, live-reloading is disabled. Cause: {}", configFile, e);
++        }
++    }
++
++    private void load(boolean createIfMissingOrBroken) {
++        String config;
++        if (Files.exists(configFile)) {
++            try {
++                config = new String(Files.readAllBytes(configFile), StandardCharsets.UTF_8);
++            } catch (IOException e) {
++                e.printStackTrace();
++                return;
++            }
++        } else {
++            if (createIfMissingOrBroken) {
++                save();
++            }
++            return;
++        }
++        Gson gson = new Gson();
++        JsonObject root = gson.fromJson(config, JsonObject.class);
++        if (root == null) {
++            LOGGER.error("Config file {} appears corrupted: {}", configFile, config);
++            if (createIfMissingOrBroken) {
++                save();
++            }
++            return;
++        }
++        for (Map.Entry<SettingsRegistry.SettingKey<?>, Object> entry : settings.entrySet()) {
++            SettingsRegistry.SettingKey<?> key = entry.getKey();
++            JsonElement category = root.get(key.getCategory());
++            if (category != null && category.isJsonObject()) {
++                JsonElement valueElem = category.getAsJsonObject().get(key.getKey());
++                if (valueElem == null || !valueElem.isJsonPrimitive()) continue;
++                JsonPrimitive value = valueElem.getAsJsonPrimitive();
++                if (key.getDefault() instanceof Boolean && value.isBoolean()) {
++                    entry.setValue(value.getAsBoolean());
++                }
++                if (key.getDefault() instanceof Integer && value.isNumber()) {
++                    entry.setValue(value.getAsNumber().intValue());
++                }
++                if (key.getDefault() instanceof Double && value.isNumber()) {
++                    entry.setValue(value.getAsNumber().doubleValue());
++                }
++                if (key.getDefault() instanceof String && value.isString()) {
++                    String valueStr = value.getAsString();
++                    if (entry instanceof SettingsRegistry.MultipleChoiceSettingKey) {
++                        @SuppressWarnings("unchecked")
++                        List<String> choices = ((SettingsRegistry.MultipleChoiceSettingKey<String>) entry).getChoices();
++                        if (choices.stream().noneMatch(valueStr::equals)) {
++                            continue;
++                        }
++                    }
++                    entry.setValue(valueStr);
++                }
++            }
++        }
++    }
++
++    private void registerWatcher() throws IOException {
++        WatchService watchService = configFile.getFileSystem().newWatchService();
++        configFile.getParent().register(watchService, StandardWatchEventKinds.ENTRY_CREATE, StandardWatchEventKinds.ENTRY_MODIFY);
++        Thread thread = new Thread(() -> {
++            while (true) {
++                WatchKey nextKey;
++                try {
++                    nextKey = watchService.take();
++                } catch (InterruptedException e) {
++                    return;
++                }
++                for (WatchEvent<?> event : nextKey.pollEvents()) {
++                    WatchEvent.Kind<?> kind = event.kind();
++                    if (kind == StandardWatchEventKinds.OVERFLOW) {
++                        continue;
++                    }
++                    Path fileName = ((Path) event.context());
++                    if (fileName.equals(configFile.getFileName())) {
++                        MinecraftClient.getInstance().execute(java.util.concurrent.Executors.callable(this::reload));
++                    }
++                }
++                if (!nextKey.reset()) {
++                    return;
++                }
++            }
++        });
++        thread.setName("replaymod-config-watcher");
++        thread.setDaemon(true);
++        thread.start();
++    }
++
++    private void reload() {
++        load(false);
++
++        SettingsRegistry settingsRegistry = ReplayMod.instance.getSettingsRegistry();
++        for (SettingsRegistry.SettingKey<?> key : settings.keySet()) {
++            SettingsChangedCallback.EVENT.invoker().onSettingsChanged(settingsRegistry, key);
++        }
++    }
++
++    @SuppressWarnings("unused")
++    public void register(SettingsRegistry.SettingKey<?> key) {
++    }
++
++    @SuppressWarnings("unused")
++    public <T> void update(SettingsRegistry.SettingKey<T> key, T value) {
++    }
++
++    public void save() {
++        JsonObject root = new JsonObject();
++        for (Map.Entry<SettingsRegistry.SettingKey<?>, Object> entry : settings.entrySet()) {
++            SettingsRegistry.SettingKey<?> key = entry.getKey();
++            JsonObject category = root.getAsJsonObject(key.getCategory());
++            if (category == null) {
++                category = new JsonObject();
++                root.add(key.getCategory(), category);
++            }
++
++            Object value = entry.getValue();
++            if (value instanceof Boolean) {
++                category.addProperty(key.getKey(), (Boolean) value);
++            }
++            if (value instanceof Number) {
++                category.addProperty(key.getKey(), (Number) value);
++            }
++            if (value instanceof String) {
++                category.addProperty(key.getKey(), (String) value);
++                if (key instanceof SettingsRegistry.MultipleChoiceSettingKey) {
++                    @SuppressWarnings("unchecked")
++                    List<String> choices = ((SettingsRegistry.MultipleChoiceSettingKey<String>) key).getChoices();
++                    JsonArray array = new JsonArray();
++                    for (String choice : choices) {
++                        array.add(choice);
++                    }
++                    category.add(key.getKey() + "_valid_values", array);
++                }
++            }
++        }
++        Gson gson = new GsonBuilder().setPrettyPrinting().create();
++        String config = gson.toJson(root);
++        try {
++            ensureDirectoryExists(configFile.getParent());
++            Files.write(configFile, config.getBytes(StandardCharsets.UTF_8));
++        } catch (IOException e) {
++            e.printStackTrace();
++        }
++    }
++}
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/core/gui/GuiFactory.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/gui/GuiFactory.java
+new file mode 100644
+index 0000000000..c690defcd7
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/gui/GuiFactory.java
+@@ -0,0 +1 @@
++// Forge only
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/core/gui/ModMenuApiImpl.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/gui/ModMenuApiImpl.java
+new file mode 100644
+index 0000000000..1f46736f7c
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/gui/ModMenuApiImpl.java
+@@ -0,0 +1 @@
++// Not applicable to Legacy Fabric
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/GameOptionsAccessor.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/GameOptionsAccessor.java
+new file mode 100644
+index 0000000000..63b484ea34
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/GameOptionsAccessor.java
+@@ -0,0 +1,17 @@
++package com.replaymod.core.mixin;
++
++import net.minecraft.client.option.GameOptions;
++import net.minecraft.client.option.KeyBinding;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.gen.Accessor;
++import org.spongepowered.asm.mixin.Mutable;
++
++@Mixin(GameOptions.class)
++public interface GameOptionsAccessor {
++    @Accessor("allKeys")
++    KeyBinding[] getAllKeys();
++
++    @Accessor("allKeys")
++    @Mutable
++    void setAllKeys(KeyBinding[] value);
++}
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/MixinLegacyGameOptions.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/MixinLegacyGameOptions.java
+new file mode 100644
+index 0000000000..f57086b4f1
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/MixinLegacyGameOptions.java
+@@ -0,0 +1,16 @@
++package com.replaymod.core.mixin;
++
++import com.replaymod.core.versions.LegacyKeyBindings;
++import net.minecraft.client.option.GameOptions;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++@Mixin(GameOptions.class)
++public abstract class MixinLegacyGameOptions {
++    @Inject(method = "load", at = @At("HEAD"))
++    private void replayModCore_addPendingKeyBindings(CallbackInfo ci) {
++        LegacyKeyBindings.applyPending((GameOptions) (Object) this);
++    }
++}
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/MixinLegacyGameRenderer.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/MixinLegacyGameRenderer.java
+new file mode 100644
+index 0000000000..1995dbcef1
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/MixinLegacyGameRenderer.java
+@@ -0,0 +1,47 @@
++package com.replaymod.core.mixin;
++
++import com.replaymod.core.events.PostRenderCallback;
++import com.replaymod.core.events.PostRenderWorldCallback;
++import com.replaymod.core.events.PreRenderCallback;
++import com.replaymod.core.events.PreRenderHandCallback;
++import de.johni0702.minecraft.gui.versions.MatrixStack;
++import net.minecraft.client.render.GameRenderer;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.Redirect;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++/**
++ * Events which Forge provides for legacy versions (render tick, RenderWorldLastEvent, RenderHandEvent)
++ * but Legacy Fabric does not.
++ */
++@Mixin(GameRenderer.class)
++public abstract class MixinLegacyGameRenderer {
++    @Inject(method = "render(FJ)V", at = @At("HEAD"))
++    private void replayModCore_preRender(float partialTicks, long nanoTime, CallbackInfo ci) {
++        PreRenderCallback.EVENT.invoker().preRender();
++    }
++
++    @Inject(method = "render(FJ)V", at = @At("RETURN"))
++    private void replayModCore_postRender(float partialTicks, long nanoTime, CallbackInfo ci) {
++        PostRenderCallback.EVENT.invoker().postRender();
++    }
++
++    // Forge fires RenderWorldLastEvent right before the hand is rendered
++    @Inject(method = "renderWorld(IFJ)V",
++            at = @At(value = "INVOKE_STRING",
++                    target = "Lnet/minecraft/util/profiler/Profiler;swap(Ljava/lang/String;)V",
++                    args = "ldc=hand"))
++    private void replayModCore_postRenderWorld(int pass, float partialTicks, long finishTimeNano, CallbackInfo ci) {
++        PostRenderWorldCallback.EVENT.invoker().postRenderWorld(new MatrixStack());
++    }
++
++    @Redirect(method = "renderWorld(IFJ)V",
++            at = @At(value = "INVOKE", target = "Lnet/minecraft/client/render/GameRenderer;renderHand(FI)V"))
++    private void replayModCore_renderHand(GameRenderer self, float partialTicks, int pass) {
++        if (!PreRenderHandCallback.EVENT.invoker().preRenderHand()) {
++            self.renderHand(partialTicks, pass);
++        }
++    }
++}
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/MixinLegacyInGameHud.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/MixinLegacyInGameHud.java
+new file mode 100644
+index 0000000000..e03e946c5f
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/MixinLegacyInGameHud.java
+@@ -0,0 +1,31 @@
++package com.replaymod.core.mixin;
++
++import com.replaymod.replay.events.RenderHotbarCallback;
++import com.replaymod.replay.events.RenderSpectatorCrosshairCallback;
++import net.minecraft.client.gui.hud.InGameHud;
++import net.minecraft.client.util.Window;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
++
++/**
++ * Forge's RenderGameOverlayEvent.Pre for the hotbar and the crosshair, which Legacy Fabric does not provide.
++ */
++@Mixin(InGameHud.class)
++public abstract class MixinLegacyInGameHud {
++    @Inject(method = "renderHotbar", at = @At("HEAD"), cancellable = true)
++    private void replayModCore_renderHotbar(Window window, float partialTicks, CallbackInfo ci) {
++        if (RenderHotbarCallback.EVENT.invoker().shouldRenderHotbar() == Boolean.FALSE) {
++            ci.cancel();
++        }
++    }
++
++    @Inject(method = "showCrosshair", at = @At("RETURN"), cancellable = true)
++    private void replayModCore_showCrosshair(CallbackInfoReturnable<Boolean> ci) {
++        if (ci.getReturnValueZ() && RenderSpectatorCrosshairCallback.EVENT.invoker().shouldRenderSpectatorCrosshair() == Boolean.FALSE) {
++            ci.setReturnValue(false);
++        }
++    }
++}
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/MixinLegacyScroll.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/MixinLegacyScroll.java
+new file mode 100644
+index 0000000000..0c2c697596
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/MixinLegacyScroll.java
+@@ -0,0 +1,25 @@
++package com.replaymod.core.mixin;
++
++import com.replaymod.replay.InputReplayTimer;
++import net.minecraft.client.MinecraftClient;
++import org.lwjgl.input.Mouse;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++/**
++ * Feeds the mouse wheel to the replay camera (speed adjustment).
++ * <p>
++ * On Forge this wraps the read of the wheel delta in the mouse event loop. Other mods redirect that read as well
++ * and only one redirect can apply, so instead we look at the wheel once per mouse event, at the start of the loop
++ * body, which is a place no other mod we know of needs.
++ */
++@Mixin(MinecraftClient.class)
++public abstract class MixinLegacyScroll {
++    @Inject(method = "tick",
++            at = @At(value = "INVOKE", target = "Lorg/lwjgl/input/Mouse;getEventButton()I", remap = false, ordinal = 0))
++    private void replayModCore_scroll(CallbackInfo ci) {
++        InputReplayTimer.handleScroll(Mouse.getEventDWheel());
++    }
++}
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/MixinLegacySpectatorHud.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/MixinLegacySpectatorHud.java
+new file mode 100644
+index 0000000000..e566673ee7
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/MixinLegacySpectatorHud.java
+@@ -0,0 +1,22 @@
++package com.replaymod.core.mixin;
++
++import com.replaymod.replay.events.RenderHotbarCallback;
++import net.minecraft.client.gui.hud.SpectatorHud;
++import net.minecraft.client.util.Window;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++/**
++ * Forge treats the spectator menu as part of the hotbar (RenderGameOverlayEvent.Pre HOTBAR).
++ */
++@Mixin(SpectatorHud.class)
++public abstract class MixinLegacySpectatorHud {
++    @Inject(method = "render(Lnet/minecraft/client/util/Window;F)V", at = @At("HEAD"), cancellable = true)
++    private void replayModCore_renderHotbar(Window window, float partialTicks, CallbackInfo ci) {
++        if (RenderHotbarCallback.EVENT.invoker().shouldRenderHotbar() == Boolean.FALSE) {
++            ci.cancel();
++        }
++    }
++}
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/Mixin_InjectDynamicResourcePacks.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/Mixin_InjectDynamicResourcePacks.java
+new file mode 100644
+index 0000000000..1f46736f7c
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/mixin/Mixin_InjectDynamicResourcePacks.java
+@@ -0,0 +1 @@
++// Not applicable to Legacy Fabric
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/core/oneconfig/OneConfigSupport.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/oneconfig/OneConfigSupport.java
+new file mode 100644
+index 0000000000..9a5875252c
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/oneconfig/OneConfigSupport.java
+@@ -0,0 +1,23 @@
++package com.replaymod.core.oneconfig;
++
++import net.fabricmc.loader.api.FabricLoader;
++import org.apache.logging.log4j.LogManager;
++
++/**
++ * Registers ReplayMod with OneConfig if that is installed.
++ * <p>
++ * The part which depends on OneConfig is compiled separately (it requires a newer Java than the rest of the mod) and
++ * is only ever loaded through here, so nothing breaks when OneConfig is not installed.
++ */
++public class OneConfigSupport {
++    public static void registerIfPresent() {
++        if (!FabricLoader.getInstance().isModLoaded("oneconfigv1")) {
++            return;
++        }
++        try {
++            Class.forName("com.replaymod.core.oneconfig.ReplayModOneConfig").getDeclaredConstructor().newInstance();
++        } catch (Throwable t) {
++            LogManager.getLogger("replaymod/oneconfig").warn("Could not register with OneConfig", t);
++        }
++    }
++}
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/core/tweaker/ReplayModTweaker.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/tweaker/ReplayModTweaker.java
+new file mode 100644
+index 0000000000..c690defcd7
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/tweaker/ReplayModTweaker.java
+@@ -0,0 +1 @@
++// Forge only
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/core/utils/ModInfoGetter.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/utils/ModInfoGetter.java
+new file mode 100644
+index 0000000000..f5ab426701
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/utils/ModInfoGetter.java
+@@ -0,0 +1,34 @@
++package com.replaymod.core.utils;
++
++import com.replaymod.replaystudio.data.ModInfo;
++import net.fabricmc.loader.api.FabricLoader;
++import net.fabricmc.loader.api.ModContainer;
++import net.minecraft.block.Block;
++import net.minecraft.item.Item;
++import net.minecraft.util.Identifier;
++
++import java.util.Collection;
++import java.util.Map;
++import java.util.Objects;
++import java.util.function.Function;
++import java.util.stream.Collectors;
++import java.util.stream.Stream;
++import java.util.stream.StreamSupport;
++
++class ModInfoGetter {
++    static Collection<ModInfo> getInstalledNetworkMods() {
++        Map<String, ModInfo> modInfoMap = FabricLoader.getInstance().getAllMods().stream()
++                .map(ModContainer::getMetadata)
++                .map(m -> new ModInfo(m.getId(), m.getName(), m.getVersion().toString()))
++                .collect(Collectors.toMap(ModInfo::getId, Function.identity(), (a, b) -> a));
++        Stream<Identifier> blocks = StreamSupport.stream(((Iterable<Block>) Block.REGISTRY).spliterator(), false)
++                .map(block -> (Identifier) Block.REGISTRY.getIdentifier(block));
++        Stream<Identifier> items = StreamSupport.stream(((Iterable<Item>) Item.REGISTRY).spliterator(), false)
++                .map(item -> (Identifier) Item.REGISTRY.getIdentifier(item));
++        return Stream.concat(blocks, items)
++                .filter(Objects::nonNull)
++                .map(Identifier::getNamespace).filter(s -> !s.equals("minecraft")).distinct()
++                .map(modInfoMap::get).filter(Objects::nonNull)
++                .collect(Collectors.toList());
++    }
++}
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/core/versions/LegacyKeyBindings.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/versions/LegacyKeyBindings.java
+new file mode 100644
+index 0000000000..84ba2da160
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/versions/LegacyKeyBindings.java
+@@ -0,0 +1,46 @@
++package com.replaymod.core.versions;
++
++import com.replaymod.core.mixin.GameOptionsAccessor;
++import net.minecraft.client.MinecraftClient;
++import net.minecraft.client.option.GameOptions;
++import net.minecraft.client.option.KeyBinding;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
++/**
++ * Adds key bindings to the options screen on Minecraft versions where no API for that exists on the loader.
++ * <p>
++ * Mods get initialized before the game options exist, so bindings registered by then are added to the options
++ * right before they load their saved values.
++ */
++public class LegacyKeyBindings {
++    private static final List<KeyBinding> pending = new ArrayList<>();
++
++    public static void register(KeyBinding keyBinding) {
++        GameOptions options = MinecraftClient.getInstance().options;
++        if (options == null) {
++            pending.add(keyBinding);
++        } else {
++            add(options, keyBinding);
++            options.load();
++        }
++    }
++
++    /** Called right before the options load their values for the first time. */
++    public static void applyPending(GameOptions options) {
++        for (KeyBinding keyBinding : pending) {
++            add(options, keyBinding);
++        }
++        pending.clear();
++    }
++
++    private static void add(GameOptions options, KeyBinding keyBinding) {
++        GameOptionsAccessor accessor = (GameOptionsAccessor) options;
++        KeyBinding[] keys = accessor.getAllKeys();
++        KeyBinding[] extended = Arrays.copyOf(keys, keys.length + 1);
++        extended[keys.length] = keyBinding;
++        accessor.setAllKeys(extended);
++    }
++}
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/core/versions/forge/EventsAdapter.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/versions/forge/EventsAdapter.java
+new file mode 100644
+index 0000000000..c690defcd7
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/core/versions/forge/EventsAdapter.java
+@@ -0,0 +1 @@
++// Forge only
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/recording/handler/FMLHandshakeFilter.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/recording/handler/FMLHandshakeFilter.java
+new file mode 100644
+index 0000000000..c690defcd7
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/recording/handler/FMLHandshakeFilter.java
+@@ -0,0 +1 @@
++// Forge only
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/recording/mixin/MixinLegacyCustomPayload.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/recording/mixin/MixinLegacyCustomPayload.java
+new file mode 100644
+index 0000000000..77dc3723b0
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/recording/mixin/MixinLegacyCustomPayload.java
+@@ -0,0 +1,30 @@
++package com.replaymod.recording.mixin;
++
++import net.minecraft.network.packet.s2c.play.CustomPayloadS2CPacket;
++import net.minecraft.util.PacketByteBuf;
++import org.spongepowered.asm.mixin.Final;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.Shadow;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++/**
++ * Vanilla (up to and including 1.8.9) consumes the payload buffer of this packet when writing it, which
++ * leaves nothing for the actual packet handler when we have written it out into the recording before.
++ * Forge patches this, so on loaders without that patch we do the same.
++ */
++@Mixin(CustomPayloadS2CPacket.class)
++public abstract class MixinLegacyCustomPayload {
++    @Shadow
++    private String channel;
++    @Shadow
++    private PacketByteBuf payload;
++
++    @Inject(method = "write(Lnet/minecraft/util/PacketByteBuf;)V", at = @At("HEAD"), cancellable = true)
++    private void replayModRecording_writeWithoutConsuming(PacketByteBuf buf, CallbackInfo ci) {
++        buf.writeString(this.channel);
++        buf.writeBytes(this.payload, this.payload.readerIndex(), this.payload.readableBytes());
++        ci.cancel();
++    }
++}
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/recording/mixin/MixinNetHandlerLoginClient.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/recording/mixin/MixinNetHandlerLoginClient.java
+new file mode 100644
+index 0000000000..8b330b6905
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/recording/mixin/MixinNetHandlerLoginClient.java
+@@ -0,0 +1,27 @@
++package com.replaymod.recording.mixin;
++
++import com.replaymod.recording.ReplayModRecording;
++import net.minecraft.client.network.ClientLoginNetworkHandler;
++import net.minecraft.network.ClientConnection;
++import net.minecraft.network.packet.s2c.login.LoginSuccessS2CPacket;
++import org.spongepowered.asm.mixin.Final;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.Shadow;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++@Mixin(ClientLoginNetworkHandler.class)
++public abstract class MixinNetHandlerLoginClient {
++    @Final
++    @Shadow
++    private ClientConnection connection;
++
++    /**
++     * Starts the recording right before switching into PLAY state.
++     */
++    @Inject(method = "onLoginSuccess", at = @At("HEAD"))
++    private void replayModRecording_initiateRecording(LoginSuccessS2CPacket packet, CallbackInfo ci) {
++        ReplayModRecording.instance.initiateRecording(this.connection);
++    }
++}
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/recording/mixin/MixinNetworkDispatcher.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/recording/mixin/MixinNetworkDispatcher.java
+new file mode 100644
+index 0000000000..c690defcd7
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/recording/mixin/MixinNetworkDispatcher.java
+@@ -0,0 +1 @@
++// Forge only
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/render/mixin/Mixin_SkipHudDuringRender.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/render/mixin/Mixin_SkipHudDuringRender.java
+new file mode 100644
+index 0000000000..0c51eb6a86
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/render/mixin/Mixin_SkipHudDuringRender.java
+@@ -0,0 +1,19 @@
++package com.replaymod.render.mixin;
++
++import com.replaymod.render.hooks.EntityRendererHandler;
++import net.minecraft.client.MinecraftClient;
++import net.minecraft.client.gui.hud.InGameHud;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++@Mixin(InGameHud.class)
++public abstract class Mixin_SkipHudDuringRender {
++    @Inject(method = "render(F)V", at = @At("HEAD"), cancellable = true)
++    private void replayModRender_skipHudDuringRender(float partialTicks, CallbackInfo ci) {
++        if (((EntityRendererHandler.IEntityRenderer) MinecraftClient.getInstance().gameRenderer).replayModRender_getHandler() != null) {
++            ci.cancel();
++        }
++    }
++}
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/replay/events/ReplayChatMessageEvent.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/replay/events/ReplayChatMessageEvent.java
+new file mode 100644
+index 0000000000..1f46736f7c
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/replay/events/ReplayChatMessageEvent.java
+@@ -0,0 +1 @@
++// Not applicable to Legacy Fabric
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/replay/events/ReplayDispatchKeypressesEvent.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/replay/events/ReplayDispatchKeypressesEvent.java
+new file mode 100644
+index 0000000000..1f46736f7c
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/replay/events/ReplayDispatchKeypressesEvent.java
+@@ -0,0 +1 @@
++// Not applicable to Legacy Fabric
+diff --git a/versions/1.8.9-fabric/src/main/java/com/replaymod/replay/mixin/MixinLegacyCamera.java b/versions/1.8.9-fabric/src/main/java/com/replaymod/replay/mixin/MixinLegacyCamera.java
+new file mode 100644
+index 0000000000..240ca02caa
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/java/com/replaymod/replay/mixin/MixinLegacyCamera.java
+@@ -0,0 +1,27 @@
++package com.replaymod.replay.mixin;
++
++import com.mojang.blaze3d.platform.GlStateManager;
++import com.replaymod.replay.camera.CameraEntity;
++import net.minecraft.client.MinecraftClient;
++import net.minecraft.client.render.GameRenderer;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++/**
++ * Applies the roll of the replay camera. On Forge this is done via EntityViewRenderEvent.CameraSetup.
++ * <p>
++ * Everything the camera setup does before rotating by yaw and pitch only translates along the z axis, which a
++ * rotation around the z axis leaves untouched, so applying the roll right at the start is equivalent.
++ */
++@Mixin(GameRenderer.class)
++public abstract class MixinLegacyCamera {
++    @Inject(method = "transformCamera", at = @At("HEAD"))
++    private void replayModReplay_applyRoll(float partialTicks, CallbackInfo ci) {
++        Object cameraEntity = MinecraftClient.getInstance().getCameraEntity();
++        if (cameraEntity instanceof CameraEntity) {
++            GlStateManager.rotate(((CameraEntity) cameraEntity).roll, 0, 0, 1);
++        }
++    }
++}
+diff --git a/versions/1.8.9-fabric/src/main/resources/fabric.mod.json b/versions/1.8.9-fabric/src/main/resources/fabric.mod.json
+new file mode 100644
+index 0000000000..2b1d0ddc28
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/resources/fabric.mod.json
+@@ -0,0 +1,51 @@
++{
++  "schemaVersion": 1,
++  "id": "replaymod",
++  "version": "${version}",
++
++  "name": "Replay Mod",
++  "description": "A Mod which allows you to record, replay and share your Minecraft experience.",
++  "authors": [
++    "CrushedPixel",
++    "johni0702"
++  ],
++  "contact": {
++    "homepage": "https://replaymod.com/",
++    "sources": "https://github.com/ReplayMod/ReplayMod"
++  },
++
++  "license": "GPL-3.0-or-later",
++  "icon": "assets/replaymod/favicon_logo.png",
++
++  "environment": "client",
++  "entrypoints": {
++    "client": [
++      "com.replaymod.core.ReplayModBackend"
++    ],
++    "preLaunch": [
++      "com.replaymod.core.DummyChainLoadEntryPoint",
++      "com.replaymod.core.MixinExtrasInit"
++    ],
++    "mm:early_risers": [
++      "com.replaymod.core.ReplayModMMLauncher"
++    ]
++  },
++  "mixins": [
++    "mixins.jgui.json",
++    "mixins.nonmmlauncher.replaymod.json"
++  ],
++  "accessWidener": "replaymod.accesswidener",
++
++  "depends": {
++    "fabricloader": ">=0.7.0"
++  },
++  "suggests": {
++    "oneconfigv1": "*"
++  },
++
++  "custom": {
++    "mm:early_risers": [
++      "com.replaymod.core.ReplayModMMLauncher"
++    ]
++  }
++}
+diff --git a/versions/1.8.9-fabric/src/main/resources/replaymod.accesswidener b/versions/1.8.9-fabric/src/main/resources/replaymod.accesswidener
+new file mode 100644
+index 0000000000..1c800a497f
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/main/resources/replaymod.accesswidener
+@@ -0,0 +1,9 @@
++accessWidener v2 named
++
++# Members which Forge's access transformers make public and which the Forge builds therefore use directly
++accessible field net/minecraft/client/gui/widget/ButtonWidget width I
++accessible field net/minecraft/client/gui/widget/ButtonWidget height I
++accessible field net/minecraft/client/MinecraftClient textureManager Lnet/minecraft/client/texture/TextureManager;
++accessible method net/minecraft/client/MinecraftClient onResolutionChanged (II)V
++accessible method net/minecraft/client/render/GameRenderer renderHand (FI)V
++accessible method net/minecraft/client/world/ClientWorld onEntityRemoved (Lnet/minecraft/entity/Entity;)V
+diff --git a/versions/1.8.9-fabric/src/oneconfig/java/com/replaymod/core/oneconfig/ReplayModOneConfig.java b/versions/1.8.9-fabric/src/oneconfig/java/com/replaymod/core/oneconfig/ReplayModOneConfig.java
+new file mode 100644
+index 0000000000..0f6db46668
+--- /dev/null
++++ b/versions/1.8.9-fabric/src/oneconfig/java/com/replaymod/core/oneconfig/ReplayModOneConfig.java
+@@ -0,0 +1,37 @@
++package com.replaymod.core.oneconfig;
++
++import com.replaymod.core.ReplayMod;
++import com.replaymod.core.gui.GuiReplaySettings;
++import com.replaymod.replay.ReplayModReplay;
++import com.replaymod.replay.gui.screen.GuiReplayViewer;
++import net.minecraft.client.MinecraftClient;
++import org.polyfrost.oneconfig.api.config.v1.Config;
++import org.polyfrost.oneconfig.api.config.v1.annotations.Button;
++
++/**
++ * Makes ReplayMod show up in OneConfig's (and thereby OneClient's) mod list.
++ * ReplayMod keeps its own settings screen and file, so this just links to the screens.
++ */
++public class ReplayModOneConfig extends Config {
++    @Button(
++            title = "Replay Viewer",
++            description = "Browse, play back and edit your replays.",
++            text = "Open"
++    )
++    public static void openReplayViewer() {
++        new GuiReplayViewer(ReplayModReplay.instance).display();
++    }
++
++    @Button(
++            title = "ReplayMod Settings",
++            description = "Opens ReplayMod's own settings screen.",
++            text = "Open"
++    )
++    public static void openSettings() {
++        new GuiReplaySettings(MinecraftClient.getInstance().currentScreen, ReplayMod.instance.getSettingsRegistry()).display();
++    }
++
++    public ReplayModOneConfig() {
++        super("replaymod-oneconfig.json", "ReplayMod", Category.UTILITY);
++    }
++}
+diff --git a/versions/1.8.9/src/main/java/com/replaymod/render/mixin/Mixin_HideNameTags_LivingEntity.java b/versions/1.8.9/src/main/java/com/replaymod/render/mixin/Mixin_HideNameTags_LivingEntity.java
+index edbd70ef98..58d18d669f 100644
+--- a/versions/1.8.9/src/main/java/com/replaymod/render/mixin/Mixin_HideNameTags_LivingEntity.java
++++ b/versions/1.8.9/src/main/java/com/replaymod/render/mixin/Mixin_HideNameTags_LivingEntity.java
+@@ -11,7 +11,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+ 
+ @Mixin(RendererLivingEntity.class)
+ public abstract class Mixin_HideNameTags_LivingEntity {
+-    @Inject(method = "canRenderName", at = @At("HEAD"), cancellable = true)
++    @Inject(method = "canRenderName(Lnet/minecraft/entity/EntityLivingBase;)Z", at = @At("HEAD"), cancellable = true)
+     private void replayModRender_areAllNamesHidden(EntityLivingBase entity, CallbackInfoReturnable<Boolean> ci) {
+         EntityRendererHandler handler = ((EntityRendererHandler.IEntityRenderer) Minecraft.getMinecraft().entityRenderer).replayModRender_getHandler();
+         if (handler != null && !handler.getSettings().isRenderNameTags()) {
+diff --git a/versions/mapping-legacy-fabric-1.8.9.txt b/versions/mapping-legacy-fabric-1.8.9.txt
+new file mode 100644
+index 0000000000..f2bc852e26
+--- /dev/null
++++ b/versions/mapping-legacy-fabric-1.8.9.txt
+@@ -0,0 +1 @@
++net.minecraftforge.fml.common.versioning.ComparableVersion org.apache.maven.artifact.versioning.ComparableVersion

@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Marcelektro <marcelektro17@gmail.com>
+Date: Tue, 10 Nov 2026 09:34:00 +0100
+Subject: [PATCH] Allow overriding the version for release builds
+
+Release builds set REPLAYMOD_VERSION so the jar and fabric.mod.json get a clean version instead of the git-describe derived one (which also ends in -dirty because of the jGui submodule).
+
+diff --git a/root.gradle.kts b/root.gradle.kts
+index 89bc6e36f4..54882659c8 100755
+--- a/root.gradle.kts
++++ b/root.gradle.kts
+@@ -35,6 +35,9 @@ if (dirty) {
+     version = "$version-dirty"
+ }
+ 
++// Release builds (see .github/workflows) pass the exact version, e.g. REPLAYMOD_VERSION=2.6.28-1
++System.getenv("REPLAYMOD_VERSION")?.takeIf { it.isNotBlank() }?.let { version = it }
++
+ group = "com.replaymod"
+ 
+ val bundleJar by tasks.registering(Copy::class) {
